@@ -17,7 +17,7 @@ import queue
 import traceback
 
 # third-party deep sort
-from deep_sort_realtime.deepsort_tracker import DeepSort
+from deep_sort_realtime.deepsort_tracker import DeepSortTracker
 
 # ------------------ <<< ADDED: tiny defensive helpers (non-destructive) ------------------
 import numbers
