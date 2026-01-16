@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-# rpi_full_featured.py - YOLOv8 + DeepSORT Raspberry Pi script
-# Full merged version: includes all 2-part code features + defensive guards + debug
-
+#the previous comments are a load of bs
+#THIS FILE WILL ALWAYS BE CALLED rpi.py
 import cv2
 import socket
 import threading
@@ -16,8 +15,14 @@ from typing import List, Dict, Tuple
 import queue
 import traceback
 
+
 # third-party deep sort
-from deep_sort_realtime.deepsort_tracker import DeepSortTracker
+from deep_sort_realtime.deepsort_tracker import DeepSort
+# ===================== TRACKING STATE =====================
+active_track_ids = set()
+last_seen_ids = {}
+frame_counter = 0
+
 
 # ------------------ <<< ADDED: tiny defensive helpers (non-destructive) ------------------
 import numbers
@@ -164,18 +169,7 @@ PHONE_IP = None
 state = {"running": False, "send_video": False}
 
 # ===================== DEEPSORT TRACKER =====================
-deepsort = DeepSort(
-    max_age=25,
-    n_init=4,
-    max_cosine_distance=0.4,
-    nn_budget=100,
-    override_track_class=None
-)
-
-active_track_ids = set()
-last_seen_ids = {}
-frame_counter = 0
-
+deepsort = DeepSort()
 # ===================== HELPERS =====================
 def get_pi_ip():
     try:
@@ -574,41 +568,49 @@ def camera_loop():
 
         print(f"[DEBUG] Final detections for DeepSORT: {final_xywh}")  # Debug the final detections
 
-        # ---------------- DEEPSORT UPDATE ----------------
+        # ---------------- DEEPSORT UPDATE & TRACK HANDLING ----------------
         try:
-            if len(final_xywh) > 0:
-                detections_list_format = [
-                    [float(x1), float(y1),
-                    float(x1 + w), float(y1 + h),
-                    float(conf), int(cls_id)]
-                    for x1, y1, w, h, conf, cls_id in final_xywh
-                ]
-                print(f"[DEBUG] DeepSORT detections: {detections_list_format}")  # Debug formatted detections
-
-                tracks = deepsort.update_tracks(detections_list_format, frame=frame)
-                print(f"[DEBUG] Tracks after update: {tracks}")  # Debug tracks after update
-            else:
-                print("[DEEPSORT] No detections to track.")
-                tracks = deepsort.update_tracks([], frame=frame)
-                print(f"[DEBUG] Tracks after no detections: {tracks}")  # Debug tracks when no detections
+            # Format detections for DeepSort
+            detections_list_format = [
+                [float(x1), float(y1), float(x1 + w), float(y1 + h), float(conf), int(cls_id)]
+                for x1, y1, w, h, conf, cls_id in final_xywh
+            ] if final_xywh else []
+        
+            # Update DeepSort tracks
+            tracks = deepsort.update(detections_list_format)
+        
+            current_ids = set()
+            annotations_for_frame = []
+        
+            for tr in tracks:
+                tid = tr.get("track_id")
+                bbox = tr.get("bbox", [0,0,0,0])
+                cls_id = tr.get("class_id", "obj")
+        
+                if tid is not None:
+                    current_ids.add(tid)
+                annotations_for_frame.append({
+                    "id": tid,
+                    "bbox": bbox,
+                    "classname": str(cls_id)
+                })
+        
         except Exception as e:
             print(f"[DEEPSORT] unexpected error: {e}")
             tracks = []
-
-        # ---------------- HANDLE TRACKS ----------------
-        current_ids = set()
-        annotations_for_frame = []
-        for tr in tracks:
-            try:
-                if isinstance(getattr(tr, "det_class", None), float):
-                    continue
-            except:
-                pass
-            annotations_for_frame.append({
-                "id": tr.track_id,
-                "bbox": tr.to_ltrb(),
-                "classname": str(tr.det_class)
-            })
+            current_ids = set()
+            annotations_for_frame = []
+        
+        # ---------------- APPEAR/DISAPPEAR LOGIC ----------------
+        appeared_ids = current_ids - active_track_ids
+        disappeared_ids = {tid for tid in active_track_ids if frame_counter - last_seen_ids.get(tid, 0) > DISAPPEAR_FRAMES}
+        active_track_ids = (active_track_ids | appeared_ids) - disappeared_ids
+        
+        for tid in current_ids:
+            last_seen_ids[tid] = frame_counter
+        
+        frame_counter += 1
+        
 
         # ---------------- APPEAR/DISAPPEAR LOGIC ----------------
         appeared_ids = current_ids - active_track_ids

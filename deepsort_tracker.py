@@ -1,4 +1,3 @@
-# deep_sort_realtime/deepsort_tracker.py
 import json
 import os
 import time
@@ -10,7 +9,7 @@ from deep_sort_realtime.deep_sort.detection import Detection
 from deep_sort_realtime.deep_sort.tracker import Tracker
 from deep_sort_realtime.utils.nms import non_max_suppression
 
-class DeepSortTracker:
+class DeepSort:
     """
     Lightweight DeepSort wrapper for Raspberry Pi.
     Motion-only tracking (no embedder).
@@ -19,17 +18,25 @@ class DeepSortTracker:
 
     def __init__(
         self,
-        max_age=6,          # frames object can disappear
-        n_init=2,
-        iou_distance=0.7,
-        max_ids=10,
-        memory_file="memory.json",  # long-term object memory
+        max_age=6,                 # max frames a track can disappear before being deleted
+        n_init=2,                  # frames required to confirm a track
+        iou_distance=0.7,          # max IOU distance for bbox matching
+        max_ids=10,                # max objects stored in custom memory
+        memory_file="memory.json", # file for long-term object memory
+        max_cosine_distance=0.4,   # max cosine distance for appearance matching
+        nn_budget=100,             # max past embeddings stored per track
     ):
+        # --- custom memory ---
         self.max_ids = max_ids
         self.memory_file = memory_file
-        self._load_memory()
+        self._load_memory()  # load previously stored memory
 
-        metric = nn_matching.NearestNeighborDistanceMetric("cosine", 0.2, None)
+        # --- appearance-based metric for DeepSORT ---
+        metric = nn_matching.NearestNeighborDistanceMetric(
+           "cosine", max_cosine_distance, nn_budget
+        )
+
+        # --- initialize DeepSORT tracker ---
         self.tracker = Tracker(
             metric,
             max_iou_distance=iou_distance,
@@ -48,31 +55,23 @@ class DeepSortTracker:
         with open(self.memory_file, "w") as f:
             json.dump(self.memory, f)
 
+
+
     def update(self, detections, frame=None):
-        """
-        detections format:
-        [
-            [x1, y1, x2, y2, confidence, class_id],
-            ...
-        ]
-        """
-
         if detections is None or len(detections) == 0:
-            tracks = self.tracker.update_tracks([], frame=frame)
+            tracks = self.tracker.update([])
             return self._format_tracks(tracks)
-
+    
+        # Wrap detections in Detection objects
         formatted = []
         for det in detections:
             x1, y1, x2, y2, conf, cls = det
-            w = x2 - x1
-            h = y2 - y1
-            formatted.append(([x1, y1, w, h], float(conf), int(cls)))
-
-        tracks = self.tracker.update_tracks(formatted, frame=frame)
-
-        # --- Update memory ---
+            w, h = x2 - x1, y2 - y1
+            formatted.append(Detection(bbox=[x1, y1, w, h], confidence=float(conf), class_id=int(cls)))
+    
+        tracks = self.tracker.update(formatted) or []
+    
         self._update_memory(tracks)
-
         return self._format_tracks(tracks)
 
     def _update_memory(self, tracks):
