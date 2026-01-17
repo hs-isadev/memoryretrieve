@@ -55,38 +55,58 @@ class DeepSort:
         with open(self.memory_file, "w") as f:
             json.dump(self.memory, f)
 
-
-
     def update(self, detections, frame=None):
-        if detections is None or len(detections) == 0:
-            tracks = self.tracker.update([])
-            return self._format_tracks(tracks)
+        """
+        Update tracks with new detections.
     
-        # Wrap detections in Detection objects
-        formatted = []
-        for det in detections:
-            x1, y1, x2, y2, conf, cls = det
-            w, h = x2 - x1, y2 - y1
-            formatted.append(Detection(bbox=[x1, y1, w, h], confidence=float(conf), class_id=int(cls)))
+        detections format:
+        [
+            [x1, y1, x2, y2, confidence, class_id],
+            ...
+        ]
+        Always returns a list (even if empty).
+        """
+        try:
+            if detections is None:
+                detections = []
     
-        tracks = self.tracker.update(formatted) or []
+            if len(detections) == 0:
+                tracks = self.tracker.update([])
+                if tracks is None:
+                    tracks = []
+                return self._format_tracks(tracks) or []
     
-        self._update_memory(tracks)
-        return self._format_tracks(tracks)
+            # Wrap detections in Detection objects
+            formatted = []
+            for det in detections:
+                x1, y1, x2, y2, conf, cls = det
+                w, h = x2 - x1, y2 - y1
+                formatted.append(Detection([x1, y1, w, h], float(conf), cls))
+    
+            tracks = self.tracker.update(formatted) or []
+    
+            # Defensive: ensure tracks is always iterable
+            if tracks is None:
+                tracks = []
+    
+            self._update_memory(tracks)
+            return self._format_tracks(tracks) or []
+    
+        except Exception as e:
+            print(f"[DEEPSORT WRAPPER] update failed: {e}")
+            return []
 
     def _update_memory(self, tracks):
         now = time.time()
         # remove old memory if track disappeared long ago
         for tid in list(self.memory.keys()):
             if tid not in [t.track_id for t in tracks]:
-                # keep it short term only if object not seen
                 if now - self.memory[tid]["last_seen"] > 3600:  # 1 hour
                     del self.memory[tid]
 
         # add/update current tracks
         for t in tracks:
             if len(self.memory) >= self.max_ids and t.track_id not in self.memory:
-                # cap number of stored tracks
                 continue
             self.memory[t.track_id] = {
                 "class_id": getattr(t, "det_class", None),

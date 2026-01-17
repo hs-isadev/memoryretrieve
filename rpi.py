@@ -570,25 +570,24 @@ def camera_loop():
 
         # ---------------- DEEPSORT UPDATE & TRACK HANDLING ----------------
         try:
-            # Format detections for DeepSort
-            detections_list_format = [
-                [float(x1), float(y1), float(x1 + w), float(y1 + h), float(conf), int(cls_id)]
-                for x1, y1, w, h, conf, cls_id in final_xywh
-            ] if final_xywh else []
-        
-            # Update DeepSort tracks
-            tracks = deepsort.update(detections_list_format)
+            # Always pass a list; never None
+            ds_input = final_xywh if final_xywh else []
+            
+            # Update DeepSort tracker
+            tracks = deepsort.update(ds_input)
         
             current_ids = set()
             annotations_for_frame = []
         
             for tr in tracks:
+                # Use wrapper's output keys
                 tid = tr.get("track_id")
-                bbox = tr.get("bbox", [0,0,0,0])
-                cls_id = tr.get("class_id", "obj")
+                bbox = tr.get("bbox", [0, 0, 0, 0])
+                cls_id = tr.get("class_id", "obj")  # wrapper sets class_id
         
                 if tid is not None:
                     current_ids.add(tid)
+        
                 annotations_for_frame.append({
                     "id": tid,
                     "bbox": bbox,
@@ -597,10 +596,14 @@ def camera_loop():
         
         except Exception as e:
             print(f"[DEEPSORT] unexpected error: {e}")
+            # fallback to empty
             tracks = []
             current_ids = set()
             annotations_for_frame = []
         
+                
+                
+                
         # ---------------- APPEAR/DISAPPEAR LOGIC ----------------
         appeared_ids = current_ids - active_track_ids
         disappeared_ids = {tid for tid in active_track_ids if frame_counter - last_seen_ids.get(tid, 0) > DISAPPEAR_FRAMES}
