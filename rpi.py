@@ -604,7 +604,7 @@ def camera_loop():
                 
                 
                 
-        # ---------------- APPEAR/DISAPPEAR LOGIC ----------------
+        # ---------------- APPEAR/DISAPPEAR LOGIC + LOG/IMAGE/METADATA ----------------
         appeared_ids = current_ids - active_track_ids
         disappeared_ids = {tid for tid in active_track_ids if frame_counter - last_seen_ids.get(tid, 0) > DISAPPEAR_FRAMES}
         active_track_ids = (active_track_ids | appeared_ids) - disappeared_ids
@@ -614,11 +614,84 @@ def camera_loop():
         
         frame_counter += 1
         
+        current_time_sec = time.time()
+        
+        # --- SEND LOGS AND IMAGES FOR APPEARED ---
+        for tid in appeared_ids:
+            ann = next((a for a in annotations_for_frame if a["id"] == tid), None)
+            if ann is None:
+                continue
+        
+            # --- LOG ---
+            log_payload = {
+                "id": tid,
+                "classname": ann["classname"],
+                "bbox": ann["bbox"],
+                "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
+            }
+            send_log("appear", log_payload)
+        
+            # --- IMAGE ---
+            img_copy = draw_annotations_on_copy(frame, [ann])
+            ret, jpg = cv2.imencode(".jpg", img_copy, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+            if ret:
+                meta_payload = {
+                    "cameraId": "pi_cam_01",
+                    "videoId": f"vid_{time.strftime('%Y_%m_%d_%H%M')}",
+                    "item": ann["classname"],
+                    "confidence": float(next((d[4] for d in sanitized_dets if int(d[5]) == ann.get("classname", -1)), 0)),
+                    "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+                    "timestampSec": int(current_time_sec),
+                    "bbox": ann["bbox"],
+                    "id": tid
+                }
+                send_image_reliable(jpg.tobytes(), f"{tid}_{int(current_time_sec)}.jpg", meta_payload)
+        
+        # --- SEND LOGS FOR DISAPPEARED ---
+        for tid in disappeared_ids:
+            log_payload = {
+                "id": tid,
+                "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
+            }
+            send_log("disappear", log_payload)
+        
+            # --- IMAGE ---
+            ann = next((a for a in annotations_for_frame if a["id"] == tid), None)
+            if ann:
+                img_copy = draw_annotations_on_copy(frame, [ann])
+                ret, jpg = cv2.imencode(".jpg", img_copy, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+                if ret:
+                    meta_payload = {
+                        "cameraId": "pi_cam_01",
+                        "videoId": f"vid_{time.strftime('%Y_%m_%d_%H%M')}",
+                        "item": ann["classname"],
+                        "confidence": float(next((d[4] for d in sanitized_dets if int(d[5]) == ann.get("classname", -1)), 0)),
+                        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+                        "timestampSec": int(current_time_sec),
+                        "bbox": ann["bbox"],
+                        "id": tid
+                    }
+                    send_image_reliable(jpg.tobytes(), f"{tid}_dis_{int(current_time_sec)}.jpg", meta_payload)
+        
+        # --- SEND PER-SECOND METADATA FOR ALL TRACKED OBJECTS ---
+        if not hasattr(camera_loop, "last_meta_send"):
+            camera_loop.last_meta_send = 0
+        
+        if current_time_sec - camera_loop.last_meta_send >= 1.0:
+            camera_loop.last_meta_send = current_time_sec
+            for ann in annotations_for_frame:
+                meta_payload = {
+                    "cameraId": "pi_cam_01",
+                    "videoId": f"vid_{time.strftime('%Y_%m_%d_%H%M')}",
+                    "item": ann["classname"],
+                    "confidence": float(next((d[4] for d in sanitized_dets if int(d[5]) == ann.get("classname", -1)), 0)),
+                    "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+                    "timestampSec": int(current_time_sec),
+                    "bbox": ann["bbox"],
+                    "id": ann["id"]
+                }
+                send_log("metadata", meta_payload)
 
-        # ---------------- APPEAR/DISAPPEAR LOGIC ----------------
-        appeared_ids = current_ids - active_track_ids
-        disappeared_ids = {tid for tid in active_track_ids if frame_counter - last_seen_ids.get(tid, 0) > DISAPPEAR_FRAMES}
-        active_track_ids = (active_track_ids | appeared_ids) - disappeared_ids
 
         # ---------------- HANDLE APPEARED/DIASAPPEARED ----------------
         # Add logic to handle appeared and disappeared IDs as needed (e.g., sending images, etc.)
