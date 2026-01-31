@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 #the previous comments are a load of bs
 #THIS FILE WILL ALWAYS BE CALLED rpi.py
+import sys
+sys.path.insert(0, "/home/pi/deep_sort_realtime")
+
 import cv2
 import socket
 import threading
@@ -14,14 +17,21 @@ from picamera2 import Picamera2
 from typing import List, Dict, Tuple
 import queue
 import traceback
+import datetime
+
 
 
 # third-party deep sort
-from deep_sort_realtime.deepsort_tracker import DeepSort
+from deepsort_wrapper import DeepSort
+
+
+
+
 # ===================== TRACKING STATE =====================
 active_track_ids = set()
 last_seen_ids = {}
 frame_counter = 0
+previous_bboxes = {}
 
 
 # ------------------ <<< ADDED: tiny defensive helpers (non-destructive) ------------------
@@ -160,7 +170,7 @@ sock_video = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock_image = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 ack_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 try:
-    ack_sock.bind(("0.0.0.0", ACK_PORT))
+    
     ack_sock.settimeout(0.01)
 except Exception:
     ack_sock.settimeout(0.01)
@@ -169,7 +179,11 @@ PHONE_IP = None
 state = {"running": False, "send_video": False}
 
 # ===================== DEEPSORT TRACKER =====================
-deepsort = DeepSort()
+deepsort = DeepSort(
+    max_age=6,
+    n_init=2
+)
+
 # ===================== HELPERS =====================
 def get_pi_ip():
     try:
@@ -181,6 +195,17 @@ def get_pi_ip():
     except:
         return "0.0.0.0"
 
+def send_meta(payload):
+    if PHONE_IP is None:
+        return
+    try:
+        msg = json.dumps(payload)
+        sock_image.sendto(msg.encode(), (PHONE_IP, ACK_PORT))
+
+    except Exception as e:
+        print("[META] send error:", e)
+
+
 def send_log(event_type, payload):
     global PHONE_IP
     if PHONE_IP is None: return
@@ -191,22 +216,7 @@ def send_log(event_type, payload):
     except Exception as e:
         print("[LOG] send error:", e)
 
-def wait_for_ack(fname, seq, timeout=0.25):
-    end = time.time() + timeout
-    try:
-        while time.time() < end:
-            try:
-                data, addr = ack_sock.recvfrom(2048)
-                msg = data.decode(errors='ignore')
-                if msg.startswith("ACK|"):
-                    parts = msg.split("|")
-                    if len(parts) >= 3 and parts[1] == fname and int(parts[2]) == seq:
-                        return True
-            except socket.timeout:
-                pass
-    except Exception:
-        pass
-    return False
+
 
 def send_chunk_with_ack(img_bytes: bytes, fname: str, seq: int, total: int, addr_tuple):
     crc = zlib.crc32(img_bytes) & 0xffffffff
@@ -229,41 +239,36 @@ CHUNK_SIZE = 60000  # safe UDP chunk size
 ACK_TIMEOUT = 0.5   # seconds
 MAX_RETRIES = 5
 
-def send_image_reliable(img_bytes, fname, metadata):
+def send_image_reliable(img_bytes: bytes, fname: str, metadata: dict):
     """
-    Sends an image reliably over UDP to the phone by splitting into chunks.
-    Requires a simple ACK protocol on the phone side.
+    Sends image chunks using the EXACT protocol expected by Android:
+    IMG|fname|seq|total|crc|len|<binary>
     """
     if not PHONE_IP:
         return
 
-    total_size = len(img_bytes)
-    num_chunks = (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE
-    msg_id = int(time.time() * 1000) & 0xFFFFFFFF
+    CHUNK = 1300  # matches Android safe size
+    total = (len(img_bytes) + CHUNK - 1) // CHUNK
 
-    for chunk_idx in range(num_chunks):
-        start = chunk_idx * CHUNK_SIZE
-        end = start + CHUNK_SIZE
+    for seq in range(total):
+        start = seq * CHUNK
+        end = start + CHUNK
         chunk = img_bytes[start:end]
 
-        # UDP packet format: [msg_id(4B)][total_chunks(2B)][chunk_idx(2B)][payload]
-        header = struct.pack(">IHH", msg_id, num_chunks, chunk_idx)
-        packet = header + chunk
+        crc = zlib.crc32(chunk) & 0xffffffff
+        header = (
+            f"IMG|{fname}|{seq}|{total}|{crc}|{len(chunk)}|"
+        ).encode("utf-8")
 
-        for attempt in range(MAX_RETRIES):
-            sock_video.sendto(packet, (PHONE_IP, PHONE_VIDEO_PORT))
-            # Optional: wait for ACK from phone
-            # ack = sock_video.recvfrom(1024)
-            # if ack indicates success: break
-            time.sleep(0.01)  # tiny delay between retries
+        try:
+            sock_image.sendto(
+                header + chunk,
+                (PHONE_IP, PHONE_IMAGE_PORT)
+            )
+        except Exception as e:
+            print("[IMG] send error:", e)
 
-    # Send metadata as JSON after image fully sent
-    try:
-        import json
-        meta_bytes = json.dumps({"fname": fname, **metadata}).encode()
-        sock_video.sendto(meta_bytes, (PHONE_IP, PHONE_VIDEO_PORT))
-    except Exception as e:
-        print("[SEND_IMAGE] metadata send failed:", e)
+        time.sleep(0.005)  # small pacing, prevents burst loss
 
 
 # ===================== DISCOVERY & COMMAND =====================
@@ -397,9 +402,25 @@ def calibrate_color_once(pic, samples=5):
 
 import traceback
 
-import traceback
 
-import time
+
+# + helper to get confidence for a track
+def get_confidence_for_tid(tid, sanitized_list, final_xywh, annotations):
+    """
+    Return the confidence associated with a given track id.
+    """
+    for det in final_xywh:
+        x1, y1, w, h, conf, cls_id = det
+        for ann in annotations:
+            if ann["id"] == tid:
+                bx1, by1, bx2, by2 = ann["bbox"]
+                # + simple IOU check to match bbox
+                iou_w = min(bx2, x1+w) - max(bx1, x1)
+                iou_h = min(by2, y1+h) - max(by1, y1)
+                if iou_w > 0 and iou_h > 0:
+                    return conf
+    return 0.0
+
 
 # Debug time limiter (in seconds). Adjust as needed.
 debug_interval_seconds = 1
@@ -409,13 +430,31 @@ last_debug_time = time.time()
 previous_bboxes = {}
 
 def camera_loop():
-    global frame_counter, active_track_ids, last_seen_ids, previous_bboxes, last_debug_time
+    """
+    Main camera loop:
+    - Captures frames from Picamera2
+    - Runs YOLO detections
+    - Sanitizes detections for DeepSort
+    - Updates DeepSort tracker
+    - Sends appear/disappear logs and images to phone
+    - Sends live video feed if enabled
+    """
+    global frame_counter, active_track_ids, last_seen_ids
+    global previous_bboxes, last_debug_time
+    global yolo_seen_once, sanitize_empty_warned, deepsort_empty_warned
+
+    # ---- safety init ----
+    if "yolo_seen_once" not in globals():
+        yolo_seen_once = False
+    if "sanitize_empty_warned" not in globals():
+        sanitize_empty_warned = False
+    if "deepsort_empty_warned" not in globals():
+        deepsort_empty_warned = False
 
     pic = Picamera2()
     pic_config = pic.create_preview_configuration(
         main={"format": "RGB888", "size": (FRAME_WIDTH, FRAME_HEIGHT)}
     )
-
     pic.configure(pic_config)
     pic.start()
     print("[CAM] Camera started")
@@ -427,292 +466,208 @@ def camera_loop():
             time.sleep(0.02)
             continue
 
-        # --- capture frame safely ---
+        # ---------------- CAPTURE FRAME ----------------
         try:
             frame = pic.capture_array()
-            cv2.imwrite("/home/pi/debug_frame_live.jpg", frame)   # <-- Debug: save current frame
         except Exception as e:
-            print(f"[CAM] capture failed: {repr(e)}")
-            print(traceback.format_exc())  # Print the traceback for debugging
+            print("[CAM] capture failed:", repr(e))
             time.sleep(0.02)
             continue
-
         if frame is None:
-            print("[CAM] capture returned None")
             time.sleep(0.02)
             continue
 
-        # --- DEBUG SAVE ONE FRAME ---
+        # ---------------- SAVE ONE DEBUG FRAME ----------------
         if not one_debug_saved:
             try:
-                print("[DEBUG] frame type:", type(frame))
-                print("[DEBUG] frame shape:", getattr(frame, "shape", None))
-                print("[DEBUG] frame dtype:", getattr(frame, "dtype", None))
-
-                success = cv2.imwrite("/home/pi/debug_frame.jpg", frame)
-                print("[DEBUG] wrote debug_frame.jpg =", success)
-
+                cv2.imwrite("/home/pi/debug_frame.jpg", frame)
+                print("[DEBUG] saved debug_frame.jpg")
             except Exception as e:
-                print("[DEBUG] saving debug failed:", e)
-                print(traceback.format_exc())  # Print the traceback for debugging
-
+                print("[DEBUG] frame save failed:", e)
             one_debug_saved = True
 
-        # ==========================================================
-        # Debugging bounding box consistency and classification
-        current_time = time.time()
-        if current_time - last_debug_time > debug_interval_seconds:
-            last_debug_time = current_time
+        # ---------------- YOLO INFERENCE ----------------
+        try:
+            results = model(frame, imgsz=640, verbose=False)[0]
 
-            try:
-                results = model(frame, imgsz=480, verbose=False)[0]
-                raw_list = []
-                raw_data = results.boxes.data
-                if hasattr(raw_data, "tolist"):
-                    raw_list = raw_data.tolist()
+            raw_data = getattr(results.boxes, "data", [])
+            raw_list = raw_data.tolist() if hasattr(raw_data, "tolist") else []
+        except Exception as e:
+            print("[YOLO] inference failed:", e)
+            raw_list = []
 
-                for r in raw_list:
-                    if len(r) < 6:
-                        continue
-                    x1, y1, x2, y2, conf, cls_id = r
+        if not yolo_seen_once:
+            print("[YOLO] model active, class names:", model_names)
+            yolo_seen_once = True
 
-                    # Check consistency of bounding boxes between frames
-                    if cls_id in previous_bboxes:
-                        prev_bbox = previous_bboxes[cls_id]
-                        if abs(x1 - prev_bbox[0]) > 20 or abs(y1 - prev_bbox[1]) > 20:  # Tolerance of 20 pixels
-                            print(f"[DEBUG] Bounding box inconsistency detected: {prev_bbox} -> {(x1, y1, x2, y2)}")
+        print(f"[YOLO] raw detections: {len(raw_list)}")
 
-                    # Save the current bounding box for future comparison
-                    previous_bboxes[cls_id] = (x1, y1, x2, y2)
-
-                    # Debugging classification
-                    class_name = model_names.get(cls_id, "Unknown")
-                    print(f"[DEBUG] Class ID: {cls_id}, Detected as: {class_name}, Confidence: {conf}")
-
-            except Exception as e:
-                print("[DEBUG] Error during YOLO detection:", e)
+        # ---------------- FILTER BY CLASS / CONF ----------------
+        dets_for_tracker = []
+        for r in raw_list:
+            if len(r) < 6:
                 continue
+            x1, y1, x2, y2, conf, cls_id = r
+            if cls_id in TARGET_CLASS_IDS and conf >= CONF_TH:
+                dets_for_tracker.append([x1, y1, x2, y2, conf, cls_id])
 
-        # --- YOLO Detection and Processing ---
-        dets_for_tracker = []
-        try:
-            results = model(frame, imgsz=480, verbose=False)[0]
-            raw_list = []
-            raw_data = results.boxes.data
-            if hasattr(raw_data, "tolist"):
-                raw_list = raw_data.tolist()
+        if len(dets_for_tracker) == 0:
+            print("[FILTER] 0 detections after class/conf filter")
 
-            for r in raw_list:
-                if len(r) < 6:
-                    continue
-                x1, y1, x2, y2, conf, cls_id = r
-                if cls_id in TARGET_CLASS_IDS:
-                    if conf >= CONF_TH:
-                        dets_for_tracker.append([float(x1), float(y1), float(x2), float(y2), float(conf), cls_id])
-                    else:
-                        print(f"[YOLO] Skipping detection due to low confidence: {conf}, Class: {cls_id}")
-                else:
-                    print(f"[YOLO] Skipping non-target class: {model_names.get(cls_id, 'Unknown')}")
-
-        except Exception as e:
-            print("[YOLO] Detection error:", repr(e))
-            dets_for_tracker = []
-
-        # ---------------- YOLO Detection and Processing ----------------
-        # ---------------- YOLO Detection and Processing ----------------
-        dets_for_tracker = []
-        try:
-            results = model(frame, imgsz=480, verbose=False)[0]
-            raw_list = []
-            raw_data = results.boxes.data
-            if hasattr(raw_data, "tolist"):
-                raw_list = raw_data.tolist()
-
-            for r in raw_list:
-                if len(r) < 6:
-                    continue
-                x1, y1, x2, y2, conf, cls_id = r
-                print(f"[DEBUG] Raw detection class id: {cls_id}, confidence: {conf}")
-                if cls_id in TARGET_CLASS_IDS:
-                    if conf >= CONF_TH:
-                        dets_for_tracker.append([float(x1), float(y1), float(x2), float(y2), float(conf), cls_id])
-                    else:
-                        print(f"[YOLO] Skipping detection due to low confidence: {conf}, Class: {cls_id}")
-                else:
-                    print(f"[YOLO] Skipping non-target class: {model_names.get(cls_id, 'Unknown')}")
-        except Exception as e:
-            print("[YOLO] Detection error:", repr(e))
-
-        # ---------------- SANITIZE DETECTIONS ----------------
+        # ---------------- SANITIZE ----------------
         sanitized_dets = _ultimate_guard_sanitized(dets_for_tracker)
-        print(f"[DEBUG] Sanitized detections: {sanitized_dets}")  # Debug the sanitized detections
+
+        if dets_for_tracker and not sanitized_dets and not sanitize_empty_warned:
+            print("[SANITIZE] WARNING: sanitizer removed ALL detections")
+            print("[SANITIZE] input:", dets_for_tracker)
+            sanitize_empty_warned = True
+
+        final_xywh = [[x1, y1, x2 - x1, y2 - y1, conf, cls_id] for x1, y1, x2, y2, conf, cls_id in sanitized_dets]
+
+        # ---------------- PREPARE DEEPSORT INPUT ----------------
+        ds_inputs = [
+            (
+                [float(x1), float(y1), float(x2 - x1), float(y2 - y1)],
+                float(conf),
+                int(cls_id)   # pass integer class ID
+            )
+            for x1, y1, x2, y2, conf, cls_id in sanitized_dets
+            if x2 - x1 > 0 and y2 - y1 > 0
+        ]
 
 
-        # ---------------- PREPARE FOR DEEPSORT ----------------
-        final_xywh = []
-        for d in sanitized_dets:
-            try:
-                x1, y1, x2, y2, conf, cls_id = d
-                if not all(np.isfinite([x1, y1, x2, y2, conf])):
-                    print(f"[DEBUG] Skipping due to non-finite values: {d}")
-                    continue
-                w = float(x2 - x1)
-                h = float(y2 - y1)
-                if w <= 0 or h <= 0:
-                    print(f"[DEBUG] Skipping due to invalid width/height: {d}")
-                    continue
-                final_xywh.append([x1, y1, w, h, conf, cls_id])
-            except Exception as e:
-                print(f"[DEBUG] Error processing sanitized detection: {e}")
-                continue
-
-        print(f"[DEBUG] Final detections for DeepSORT: {final_xywh}")  # Debug the final detections
-
-        # ---------------- DEEPSORT UPDATE & TRACK HANDLING ----------------
+        # ---------------- UPDATE DEEPSORT ----------------
         try:
-            # Always pass a list; never None
-            ds_input = final_xywh if final_xywh else []
-            
-            # Update DeepSort tracker
-            tracks = deepsort.update(ds_input)
-        
-            current_ids = set()
-            annotations_for_frame = []
-        
-            for tr in tracks:
-                # Use wrapper's output keys
-                tid = tr.get("track_id")
-                bbox = tr.get("bbox", [0, 0, 0, 0])
-                cls_id = tr.get("class_id", "obj")  # wrapper sets class_id
-        
-                if tid is not None:
-                    current_ids.add(tid)
-        
-                annotations_for_frame.append({
-                    "id": tid,
-                    "bbox": bbox,
-                    "classname": str(cls_id)
-                })
-        
+            tracks = deepsort.update(ds_inputs, frame)
+
         except Exception as e:
-            print(f"[DEEPSORT] unexpected error: {e}")
-            # fallback to empty
+            print("[DEEPSORT] update failed:", e)
             tracks = []
-            current_ids = set()
-            annotations_for_frame = []
-        
-                
-                
-                
-        # ---------------- APPEAR/DISAPPEAR LOGIC + LOG/IMAGE/METADATA ----------------
+
+        print(f"[DEEPSORT] tracks returned: {len(tracks)}")
+
+        if final_xywh and not tracks and not deepsort_empty_warned:
+            print("[DEEPSORT] WARNING: detections sent but no tracks produced")
+            print("[DEEPSORT] input:", final_xywh)
+            deepsort_empty_warned = True
+
+        current_ids = set()
+        annotations_for_frame = []
+
+        # ---------------- PROCESS TRACKS ----------------
+        for tr in tracks:
+            tid = tr["track_id"]
+            x1, y1, x2, y2 = tr["bbox"]
+            current_ids.add(tid)
+
+            # ---------- INCONSISTENT BBOX DEBUG ----------
+            if tid in previous_bboxes:
+                px1, py1, px2, py2 = previous_bboxes[tid]
+                dx = abs(x1 - px1)
+                dy = abs(y1 - py1)
+                dw = abs((x2 - x1) - (px2 - px1))
+                dh = abs((y2 - y1) - (py2 - py1))
+                if dx > 80 or dy > 80:
+                    print(f"[BBOX-JUMP] id={tid} moved dx={dx} dy={dy}")
+                if dw > 100 or dh > 100:
+                    print(f"[BBOX-SIZE] id={tid} size jump dw={dw} dh={dh}")
+                if x2 <= x1 or y2 <= y1:
+                    print(f"[BBOX-INVALID] id={tid} bbox={x1,y1,x2,y2}")
+            previous_bboxes[tid] = (x1, y1, x2, y2)
+
+            # ---- match confidence via IoU ----
+            best_area = 0
+            conf_match = 0
+            for dx1, dy1, dx2, dy2, dconf, _ in sanitized_dets:
+                iw = max(0, min(dx2, x2) - max(dx1, x1))
+                ih = max(0, min(dy2, y2) - max(dy1, y1))
+                area = iw * ih
+                if area > best_area:
+                    best_area = area
+                    conf_match = dconf
+
+            annotations_for_frame.append({
+                "id": tid,
+                "bbox": [x1, y1, x2, y2],
+                "classname": model_names.get(int(tr["class_id"]), "obj"),
+                "confidence": float(conf_match)
+            })
+
+        # ---------------- DEBUG PRINT ----------------
+        now = time.time()
+        if now - last_debug_time > debug_interval_seconds:
+            last_debug_time = now
+            for ann in annotations_for_frame:
+                print(f"[TRACK] id={ann['id']} "
+                      f"bbox={ann['bbox']} "
+                      f"conf={ann['confidence']:.2f}")
+
+        # ---------------- APPEAR / DISAPPEAR ----------------
         appeared_ids = current_ids - active_track_ids
-        disappeared_ids = {tid for tid in active_track_ids if frame_counter - last_seen_ids.get(tid, 0) > DISAPPEAR_FRAMES}
-        active_track_ids = (active_track_ids | appeared_ids) - disappeared_ids
-        
+        disappeared_ids = {tid for tid in active_track_ids
+                           if frame_counter - last_seen_ids.get(tid, 0) > DISAPPEAR_FRAMES}
+
+        active_track_ids = (active_track_ids | current_ids) - disappeared_ids
         for tid in current_ids:
             last_seen_ids[tid] = frame_counter
-        
         frame_counter += 1
-        
-        current_time_sec = time.time()
-        
-        # --- SEND LOGS AND IMAGES FOR APPEARED ---
+
+        ts = time.time()
+
+        # ---------------- APPEARED ----------------
         for tid in appeared_ids:
             ann = next((a for a in annotations_for_frame if a["id"] == tid), None)
             if ann is None:
+                print(f"[WARN] appeared id {tid} but no annotation")
                 continue
-        
-            # --- LOG ---
-            log_payload = {
+            send_log("appear", {
                 "id": tid,
                 "classname": ann["classname"],
                 "bbox": ann["bbox"],
                 "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
-            }
-            send_log("appear", log_payload)
-        
-            # --- IMAGE ---
-            img_copy = draw_annotations_on_copy(frame, [ann])
-            ret, jpg = cv2.imencode(".jpg", img_copy, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
-            if ret:
-                meta_payload = {
-                    "cameraId": "pi_cam_01",
-                    "videoId": f"vid_{time.strftime('%Y_%m_%d_%H%M')}",
-                    "item": ann["classname"],
-                    "confidence": float(next((d[4] for d in sanitized_dets if int(d[5]) == ann.get("classname", -1)), 0)),
-                    "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-                    "timestampSec": int(current_time_sec),
-                    "bbox": ann["bbox"],
-                    "id": tid
-                }
-                send_image_reliable(jpg.tobytes(), f"{tid}_{int(current_time_sec)}.jpg", meta_payload)
-        
-        # --- SEND LOGS FOR DISAPPEARED ---
+            })
+
+        # ---------------- DISAPPEARED ----------------
         for tid in disappeared_ids:
-            log_payload = {
+            send_log("disappear", {
                 "id": tid,
                 "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
-            }
-            send_log("disappear", log_payload)
-        
-            # --- IMAGE ---
-            ann = next((a for a in annotations_for_frame if a["id"] == tid), None)
-            if ann:
-                img_copy = draw_annotations_on_copy(frame, [ann])
-                ret, jpg = cv2.imencode(".jpg", img_copy, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
-                if ret:
-                    meta_payload = {
-                        "cameraId": "pi_cam_01",
-                        "videoId": f"vid_{time.strftime('%Y_%m_%d_%H%M')}",
-                        "item": ann["classname"],
-                        "confidence": float(next((d[4] for d in sanitized_dets if int(d[5]) == ann.get("classname", -1)), 0)),
-                        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-                        "timestampSec": int(current_time_sec),
-                        "bbox": ann["bbox"],
-                        "id": tid
-                    }
-                    send_image_reliable(jpg.tobytes(), f"{tid}_dis_{int(current_time_sec)}.jpg", meta_payload)
-        
-        # --- SEND PER-SECOND METADATA FOR ALL TRACKED OBJECTS ---
-        if not hasattr(camera_loop, "last_meta_send"):
-            camera_loop.last_meta_send = 0
-        
-        if current_time_sec - camera_loop.last_meta_send >= 1.0:
-            camera_loop.last_meta_send = current_time_sec
-            for ann in annotations_for_frame:
-                meta_payload = {
-                    "cameraId": "pi_cam_01",
-                    "videoId": f"vid_{time.strftime('%Y_%m_%d_%H%M')}",
-                    "item": ann["classname"],
-                    "confidence": float(next((d[4] for d in sanitized_dets if int(d[5]) == ann.get("classname", -1)), 0)),
-                    "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-                    "timestampSec": int(current_time_sec),
-                    "bbox": ann["bbox"],
-                    "id": ann["id"]
-                }
-                send_log("metadata", meta_payload)
+            })
 
-
-        # ---------------- HANDLE APPEARED/DIASAPPEARED ----------------
-        # Add logic to handle appeared and disappeared IDs as needed (e.g., sending images, etc.)
+        # ---------------- HEARTBEAT ----------------
+        if frame_counter % 30 == 0:
+            print(f"[HEARTBEAT] frame={frame_counter} "
+                  f"raw={len(raw_list)} "
+                  f"filtered={len(dets_for_tracker)} "
+                  f"sanitized={len(sanitized_dets)} "
+                  f"tracks={len(tracks)}")
 
         # ---------------- LIVE VIDEO ----------------
-        if state.get("send_video", False) and PHONE_IP:
+        if state.get("send_video") and PHONE_IP:
             try:
                 h, w = frame.shape[:2]
                 side = min(h, w)
-                cx, cy = w // 2, h // 2
-                left, top = max(0, cx - side // 2), max(0, cy - side // 2)
-                square = frame[top:top + side, left:left + side]
-                square_resized = cv2.resize(square, (SQUARE_FEED_SIZE, SQUARE_FEED_SIZE))
-                ret, jpg = cv2.imencode(".jpg", square_resized,
-                                        [int(cv2.IMWRITE_JPEG_QUALITY), LIVE_JPEG_QUALITY])
-                if ret:
-                    sock_video.sendto(jpg.tobytes(), (PHONE_IP, PHONE_VIDEO_PORT))
-            except:
-                pass
+                y0 = (h - side) // 2
+                x0 = (w - side) // 2
+                
+                square_crop = frame[y0:y0+side, x0:x0+side]
+                square = cv2.resize(square_crop, (SQUARE_FEED_SIZE, SQUARE_FEED_SIZE))
+
+                ok, jpg = cv2.imencode(
+                    ".jpg", square,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), LIVE_JPEG_QUALITY]
+                )
+                if ok:
+                    sock_video.sendto(jpg.tobytes(),
+                                      (PHONE_IP, PHONE_VIDEO_PORT))
+            except Exception as e:
+                print("[VIDEO] send failed:", e)
 
         time.sleep(0.01)
+
+
+
+
 
 
 
