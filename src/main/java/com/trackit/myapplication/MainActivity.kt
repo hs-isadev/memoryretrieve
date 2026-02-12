@@ -55,8 +55,21 @@ class MainActivity : AppCompatActivity() {
         val ts: Long,
         val lat: Double?,
         val lon: Double?,
-        val imageBytes: ByteArray
+        val imageBytes: ByteArray,
+        var bitmap: Bitmap? = null,
+        val boxes: MutableList<BBox> = mutableListOf()
     )
+
+    data class BBox(
+        val x1: Int,
+        val y1: Int,
+        val x2: Int,
+        val y2: Int,
+        val label: String,
+        val trackId: Int
+    )
+
+
 
     private val detections = Collections.synchronizedList(mutableListOf<Detection>())
     private val filtered = mutableListOf<Detection>()
@@ -83,6 +96,7 @@ class MainActivity : AppCompatActivity() {
         startDiscovery()
         startUdpListeners()
         startImageListener()
+        startMetadataListener()
 
 
         btnStart.setOnClickListener { sendCommand("START") }
@@ -96,19 +110,62 @@ class MainActivity : AppCompatActivity() {
             override fun getView(p: Int, v: android.view.View?, parent: android.view.ViewGroup?): android.view.View {
                 val view = v ?: layoutInflater.inflate(R.layout.item_detection, parent, false)
                 val d = filtered[p]
-                val bmp = BitmapFactory.decodeByteArray(d.imageBytes, 0, d.imageBytes.size)
-                view.findViewById<ImageView>(R.id.imgThumb).setImageBitmap(bmp)
+
+                // Use stored bitmap
+                val baseBmp = d.bitmap ?: BitmapFactory.decodeByteArray(
+                    d.imageBytes, 0, d.imageBytes.size
+                )
+
+                val mutable = baseBmp.copy(Bitmap.Config.ARGB_8888, true)
+                val canvas = Canvas(mutable)
+
+                val paint = Paint().apply {
+                    color = Color.GREEN
+                    style = Paint.Style.STROKE
+                    strokeWidth = 4f
+                    textSize = 28f
+                }
+
+                for (b in d.boxes) {
+                    canvas.drawRect(
+                        b.x1.toFloat(),
+                        b.y1.toFloat(),
+                        b.x2.toFloat(),
+                        b.y2.toFloat(),
+                        paint
+                    )
+                    canvas.drawText(
+                        "${b.label}_${b.trackId}",
+                        b.x1.toFloat() + 4,
+                        b.y1.toFloat() - 6,
+                        paint
+                    )
+                }
+
+                view.findViewById<ImageView>(R.id.imgThumb).setImageBitmap(mutable)
+
+
                 view.findViewById<TextView>(R.id.textClass).text = d.className.uppercase()
                 view.findViewById<TextView>(R.id.textTrack).text = "ID: ${d.trackId}"
+
                 view.setOnClickListener {
-                    d.lat?.let { lat -> d.lon?.let { lon ->
-                        startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW,
-                            Uri.parse("geo:0,0?q=$lat,$lon(${d.className})")))
-                    }}
+                    d.lat?.let { lat ->
+                        d.lon?.let { lon ->
+                            startActivity(
+                                Intent(
+                                    Intent.ACTION_VIEW,
+                                    Uri.parse("geo:0,0?q=$lat,$lon(${d.className})")
+                                )
+                            )
+                        }
+                    }
                 }
+
                 return view
+
             }
         }
+
     }
 
     private fun sendCommand(cmd: String) {
@@ -120,6 +177,46 @@ class MainActivity : AppCompatActivity() {
                         s.send(DatagramPacket(msg, msg.size, InetAddress.getByName(ip), COMMAND_PORT))
                     }
                 } catch (e: Exception) { e.printStackTrace() }
+            }
+        }
+    }
+    private fun startMetadataListener() {
+        thread {
+            DatagramSocket(META_PORT).use { socket ->
+                val buf = ByteArray(8192)
+
+                while (true) {
+                    try {
+                        val packet = DatagramPacket(buf, buf.size)
+                        socket.receive(packet)
+
+                        val msg = String(packet.data, 0, packet.length)
+                        val json = org.json.JSONObject(msg)
+
+                        if (json.optString("type") != "bbox") continue
+
+                        val fname = json.getString("filename")
+                        val bbox = json.getJSONArray("bbox")
+
+                        val box = BBox(
+                            x1 = bbox.getInt(0),
+                            y1 = bbox.getInt(1),
+                            x2 = bbox.getInt(2),
+                            y2 = bbox.getInt(3),
+                            label = json.getString("classname"),
+                            trackId = json.getInt("trackId")
+                        )
+
+                        handler.post {
+                            detections.find { it.filename == fname }
+                                ?.boxes
+                                ?.add(box)
+                        }
+
+                    } catch (e: Exception) {
+                        Log.e("META", "bbox recv error", e)
+                    }
+                }
             }
         }
     }
@@ -178,41 +275,31 @@ class MainActivity : AppCompatActivity() {
                         s.receive(p)
                         val bmp = BitmapFactory.decodeByteArray(p.data, 0, p.length)
                         handler.post { imgLive.setImageBitmap(bmp) }
-                    } catch (_: Exception) {}
+                    } catch (e: Exception) {
+                        Log.e("UDP_VIDEO", "Error receiving video: ${e.message}")
+                    }
                 }
             }
         }
-
 
         // --- LOG LISTENER ---
         thread {
             DatagramSocket(LOG_PORT).use { s ->
-                val buf = ByteArray(8192)
+                val buf = ByteArray(16384) // increase buffer size
                 while (true) {
                     try {
                         val p = DatagramPacket(buf, buf.size)
                         s.receive(p)
-                        val msg = String(p.data, 0, p.length)
-                        Log.d("PiLOG", msg)
-                    } catch (_: Exception) {}
+                        val msg = String(p.data, 0, p.length, Charsets.UTF_8)
+                        Log.d("PiLOG", "Received: $msg")
+                    } catch (e: Exception) {
+                        Log.e("PiLOG", "Listener error: ${e.message}")
+                    }
                 }
             }
         }
 
-        // --- METADATA LISTENER ---
-        thread {
-            DatagramSocket(META_PORT).use { s ->
-                val buf = ByteArray(8192)
-                while (true) {
-                    try {
-                        val p = DatagramPacket(buf, buf.size)
-                        s.receive(p)
-                        val msg = String(p.data, 0, p.length)
-                        Log.d("PiMETA", msg)
-                    } catch (_: Exception) {}
-                }
-            }
-        }
+
     }
 
 
@@ -229,114 +316,133 @@ class MainActivity : AppCompatActivity() {
             filterDetections()
         }
     }
-    private fun processFullImageWithBoxes(filename: String, bitmap: Bitmap, bboxList: List<Detection> = emptyList()) {
+    private fun processFullImageWithBoxes(
+        filename: String, bitmap: Bitmap, bboxList: List<Map<String, Any>> = emptyList()
+    ) {
         try {
             val bmpCopy = bitmap.copy(Bitmap.Config.ARGB_8888, true)
-
-            // Draw bounding boxes if provided
-            if (bboxList.isNotEmpty()) {
-                val canvas = Canvas(bmpCopy)
-                val paint = Paint().apply {
-                    color = Color.GREEN
-                    style = Paint.Style.STROKE
-                    strokeWidth = 3f
-                    textSize = 24f
-                }
-                val textBg = Paint().apply {
-                    color = Color.argb(150, 0, 0, 0)
-                    style = Paint.Style.FILL
-                }
-
-                for (d in bboxList) {
-                    // Only draw if bbox coordinates are available
-                    val rect = android.graphics.Rect(
-                        d.trackId, // TODO: replace with actual x1
-                        d.trackId, // TODO: replace with actual y1
-                        d.trackId + 100, // TODO: replace with actual x2
-                        d.trackId + 100  // TODO: replace with actual y2
-                    )
-                    canvas.drawRect(rect, paint)
-                    canvas.drawRect(rect.left.toFloat(), rect.top - 28f, rect.left + paint.measureText("${d.className}_${d.trackId}") + 8f, rect.top.toFloat(), textBg)
-                    canvas.drawText("${d.className}_${d.trackId}", rect.left.toFloat() + 4f, rect.top.toFloat() - 4f, paint)
-                }
+            val canvas = Canvas(bmpCopy)
+            val paint = Paint().apply {
+                color = Color.GREEN
+                style = Paint.Style.STROKE
+                strokeWidth = 3f
+                textSize = 24f
+            }
+            val textBg = Paint().apply {
+                color = Color.argb(150, 0, 0, 0)
+                style = Paint.Style.FILL
             }
 
-            // Save to gallery
+            for (d in bboxList) {
+                val x1 = (d["x1"] as? Number)?.toFloat() ?: 0f
+                val y1 = (d["y1"] as? Number)?.toFloat() ?: 0f
+                val x2 = (d["x2"] as? Number)?.toFloat() ?: 0f
+                val y2 = (d["y2"] as? Number)?.toFloat() ?: 0f
+                val className = d["classname"] as? String ?: "obj"
+                val trackId = (d["trackId"] as? Number)?.toInt() ?: 0
+
+                val rect = android.graphics.RectF(x1, y1, x2, y2)
+                canvas.drawRect(rect, paint)
+                canvas.drawRect(rect.left, rect.top - 28f, rect.left + paint.measureText("${className}_${trackId}") + 8f, rect.top, textBg)
+                canvas.drawText("${className}_${trackId}", rect.left + 4f, rect.top - 4f, paint)
+            }
+
             saveImageToGallery(filename, bmpCopy)
-
-            // Convert bitmap to byte array for GridView
-            val stream = java.io.ByteArrayOutputStream()
-            bmpCopy.compress(Bitmap.CompressFormat.JPEG, 90, stream)
-            val finalBytes = stream.toByteArray()
-
-            val ts = System.currentTimeMillis()
-            val gps = getNearestGps(ts)
-            val parts = filename.split("_")
-            val trackId = parts.getOrNull(0)?.toIntOrNull() ?: 0
-            val className = parts.getOrNull(1)?.removeSuffix(".jpg") ?: "object"
-
-            handler.post {
-                detections.add(0, Detection(filename, className, trackId, ts, gps?.lat, gps?.lon, finalBytes))
-                filterDetections()
-            }
 
         } catch (e: Exception) {
             e.printStackTrace()
         }
     }
 
+
     private fun startImageListener() {
         thread {
-            DatagramSocket(IMAGE_PORT).use { s ->
+            DatagramSocket(IMAGE_PORT).use { socket ->
                 val buf = ByteArray(65507)
                 val imageBuffers = HashMap<String, ImageBuffer>()
 
                 while (true) {
                     try {
-                        val p = DatagramPacket(buf, buf.size)
-                        s.receive(p)
-                        val text = String(p.data, 0, p.length, Charsets.ISO_8859_1)
+                        val packet = DatagramPacket(buf, buf.size)
+                        socket.receive(packet)
 
-                        if (text.startsWith("IMG|")) {
-                            // Extract header safely
-                            val headerEndIdx = text.indexOf('|', text.indexOf('|', text.indexOf('|', text.indexOf('|', text.indexOf('|')+1)+1)+1)+1)+1
-                            if (headerEndIdx <= 0) continue
+                        // ---- find first 6 '|' to delimit header ----
+                        val pipeIdxs = ArrayList<Int>(6)
+                        for (i in 0 until packet.length) {
+                            if (packet.data[i].toInt() == '|'.code) {
+                                pipeIdxs.add(i)
+                                if (pipeIdxs.size == 6) break
+                            }
+                        }
+                        if (pipeIdxs.size < 6) continue
 
-                            val headerStr = text.substring(0, headerEndIdx)
-                            val parts = headerStr.split("|")
-                            if (parts.size < 6) continue
+                        // ---- parse header ----
+                        val headerEnd = pipeIdxs[5] + 1
+                        val headerStr = String(packet.data, 0, headerEnd, Charsets.UTF_8)
+                        val parts = headerStr.split("|")
+                        if (parts.size < 6 || parts[0] != "IMG") continue
 
-                            val fname = parts[1]
-                            val seq = parts[2].toInt()
-                            val total = parts[3].toInt()
-                            val len = parts[5].toInt()
+                        val fname = parts[1]
+                        val seq = parts[2].toInt()
+                        val total = parts[3].toInt()
+                        val payloadLen = parts[5].toInt()
 
-                            val payload = p.data.copyOfRange(headerEndIdx, headerEndIdx + len)
+                        // ---- extract payload safely ----
+                        if (headerEnd + payloadLen > packet.length) continue
+                        val payload = packet.data.copyOfRange(
+                            headerEnd,
+                            headerEnd + payloadLen
+                        )
 
-                            val buffer = imageBuffers.getOrPut(fname) { ImageBuffer(total) }
-                            buffer.chunks[seq] = payload
+                        // ---- store chunk ----
+                        val buffer = imageBuffers.getOrPut(fname) {
+                            ImageBuffer(total)
+                        }
+                        buffer.chunks[seq] = payload
 
-                            if (buffer.chunks.size == total) {
-                                val fullImage = buffer.chunks.toSortedMap().values.reduce { a, b -> a + b }
-                                imageBuffers.remove(fname)
+                        // ---- reconstruct when complete ----
+                        if (buffer.chunks.size == total) {
+                            val fullImage = buffer.chunks
+                                .toSortedMap()
+                                .values
+                                .reduce { a, b -> a + b }
 
-                                val bmp = BitmapFactory.decodeByteArray(fullImage, 0, fullImage.size)
-                                if (bmp != null) {
-                                    handler.post {
-                                        processFullImageWithBoxes(fname, bmp)
-                                    }
-                                    Log.d("UDP_IMAGE", "Received $fname size=${fullImage.size}")
-                                } else {
-                                    Log.e("UDP_IMAGE", "Failed to decode $fname")
-                                }
+                            imageBuffers.remove(fname)
+
+                            val bmp = BitmapFactory.decodeByteArray(
+                                fullImage, 0, fullImage.size
+                            ) ?: continue
+
+                            handler.post {
+                                detections.add(
+                                    0,
+                                    Detection(
+                                        filename = fname,
+                                        className = fname.split("_").getOrNull(2) ?: "object",
+                                        trackId = fname.split("_").getOrNull(1)?.toIntOrNull() ?: 0,
+                                        ts = fname.split("_").getOrNull(0)?.toLongOrNull()
+                                            ?: System.currentTimeMillis(),
+                                        lat = getNearestGps(System.currentTimeMillis())?.lat,
+                                        lon = getNearestGps(System.currentTimeMillis())?.lon,
+                                        imageBytes = fullImage,
+                                        bitmap = bmp
+                                    )
+                                )
+                                filterDetections()
+                                grid.smoothScrollToPosition(0)
+                                saveImageToGallery(fname, bmp)
                             }
                         }
 
-                    } catch (e: Exception) { e.printStackTrace() }
+                    } catch (e: Exception) {
+                        Log.e("UDP_IMAGE", "Listener error", e)
+                    }
                 }
             }
         }
     }
+
+
 
     private fun saveImageToGallery(fname: String, bitmap: Bitmap) {
         try {
@@ -378,13 +484,16 @@ class MainActivity : AppCompatActivity() {
                         ?: locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
                     if (loc != null) {
                         gpsLog.add(GPSEntry(System.currentTimeMillis(), loc.latitude, loc.longitude))
-                        if (gpsLog.size > 1000) gpsLog.removeAt(0)
+                        if (gpsLog.size > 1000) gpsLog.removeAt(0) // keep latest 1000 points
                     }
-                } catch (e: Exception) { e.printStackTrace() }
+                } catch (e: Exception) {
+                    Log.e("GPS_LOG", "Error reading location: ${e.message}")
+                }
                 Thread.sleep(1500)
             }
         }
     }
+
 
     private fun getNearestGps(ts: Long): GPSEntry? {
         return gpsLog.minByOrNull { kotlin.math.abs(it.ts - ts) }
