@@ -199,7 +199,7 @@ class MainActivity : AppCompatActivity() {
     private val PREFS = "memoryretrieve_prefs"
     private val PREF_SUPABASE_ENABLED = "supabase_enabled"
     private val PREF_SUPABASE_KEY = "supabase_key" // put your key here securely if you want uploads
-    
+
     class MemoryRetrieveService : Service() {
         private lateinit var worker: MainActivity.ForegroundWorker
 
@@ -770,6 +770,7 @@ class MainActivity : AppCompatActivity() {
     private val videoFrameLock = Any()
     inner class ForegroundWorker(private val ctx: Context) {
         // Shared state exposed to Activity
+
         val detections = Collections.synchronizedList(mutableListOf<Detection>())
         val nodeRegistry = Collections.synchronizedMap(HashMap<String, NodeInfo>())
         val gpsLog = Collections.synchronizedList(mutableListOf<GPSEntry>())
@@ -806,6 +807,7 @@ class MainActivity : AppCompatActivity() {
             startForegroundCompat()
 
             // Kick off threads
+
             startGpsLogging()
             startSwarmHeartbeatListener()
             startDiscovery()
@@ -831,24 +833,33 @@ class MainActivity : AppCompatActivity() {
 
         // ----------------- Foreground notification (keeps it alive) -----------------
 // Call this inside a true Service (MemoryRetrieveService)
+// ----------------- Foreground Service / Notification -----------------
+
         private fun startForegroundCompat(service: Service) {
             try {
                 val nm = service.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
                 val channelId = "memretr_service_chan"
 
+                // Create notification channel if API >= 26
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    val ch = NotificationChannel(
-                        channelId,
-                        "MemoryRetrieve",
-                        NotificationManager.IMPORTANCE_LOW
-                    )
-                    nm.createNotificationChannel(ch)
+                    if (nm.getNotificationChannel(channelId) == null) {
+                        val ch = NotificationChannel(
+                            channelId,
+                            "MemoryRetrieve",
+                            NotificationManager.IMPORTANCE_LOW
+                        ).apply {
+                            description = "Foreground service for MemoryRetrieve"
+                        }
+                        nm.createNotificationChannel(ch)
+                    }
                 }
 
+                // PendingIntent to open MainActivity when notification tapped
                 val intent = Intent(service, MainActivity::class.java)
                 val pendingFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
-                    PendingIntent.FLAG_IMMUTABLE
-                else 0
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                else PendingIntent.FLAG_UPDATE_CURRENT
+
                 val pIntent = PendingIntent.getActivity(service, 0, intent, pendingFlags)
 
                 val notif = NotificationCompat.Builder(service, channelId)
@@ -857,10 +868,12 @@ class MainActivity : AppCompatActivity() {
                     .setSmallIcon(R.drawable.ic_launcher_foreground)
                     .setContentIntent(pIntent)
                     .setOngoing(true)
+                    .setOnlyAlertOnce(true)
                     .build()
 
                 // Start true foreground
                 service.startForeground(notifId, notif)
+                Log.d("FW-NOTIF", "Foreground service started successfully")
 
             } catch (e: Exception) {
                 Log.w("FW-NOTIF", "startForegroundCompat error: ${e.message}")
@@ -1009,7 +1022,8 @@ class MainActivity : AppCompatActivity() {
 
         // ----------------- UDP listeners: video + logs -----------------
         private fun startUdpListeners() {
-// ----------------- VIDEO LISTENER -----------------
+
+            // ----------------- VIDEO LISTENER -----------------
             thread(name = "UDP-Video-Listener") {
                 DatagramSocket(null).use { socket ->
                     try {
@@ -1019,27 +1033,28 @@ class MainActivity : AppCompatActivity() {
 
                         while (running) {
                             try {
-                                val buf = ByteArray(65507)   // allocate per packet (NO reuse)
+                                val buf = ByteArray(65507) // allocate per packet to avoid reuse/races
                                 val packet = DatagramPacket(buf, buf.size)
                                 socket.receive(packet)
 
                                 val bmp = BitmapFactory.decodeByteArray(packet.data, 0, packet.length)
                                 bmp?.let { newFrame ->
                                     synchronized(this) {
-                                        // recycle old bitmap to prevent memory leak
+                                        // recycle old bitmap to prevent memory leaks
                                         latestVideoFrame?.recycle()
                                         latestVideoFrame = newFrame
                                     }
                                 }
                             } catch (e: SocketTimeoutException) {
-                                // allows loop to exit cleanly when running=false
+                                // ignore, loop checks running
                             } catch (e: Exception) {
-                                Log.e("FW-VIDEO", "video recv error: ${e.message}")
+                                Log.e("FW-VIDEO", "video receive error: ${e.message}")
                                 Thread.sleep(10)
                             }
                         }
+
                     } catch (e: Exception) {
-                        Log.e("FW-VIDEO", "video socket fail: ${e.message}")
+                        Log.e("FW-VIDEO", "video socket failed: ${e.message}")
                     }
                 }
             }
@@ -1053,10 +1068,11 @@ class MainActivity : AppCompatActivity() {
                         socket.soTimeout = 500
 
                         while (running) {
-                            val buf = ByteArray(16384) // allocate per packet
                             try {
+                                val buf = ByteArray(16384) // allocate per packet
                                 val packet = DatagramPacket(buf, buf.size)
                                 socket.receive(packet)
+
                                 val msg = String(packet.data, 0, packet.length, Charsets.UTF_8)
 
                                 // Handle portal JSON forwards
@@ -1067,24 +1083,26 @@ class MainActivity : AppCompatActivity() {
                                         lastPortalHtml = html
                                         lastPortalFromIp = packet.address.hostAddress
 
-                                        // UI thread call using Activity context
-                                        (runOnUiThread) {
+                                        // Ensure UI thread call using Activity context
+                                        (ctx as? MainActivity)?.runOnUiThread {
                                             openPortalActivity(html, lastPortalFromIp)
                                         }
                                         continue
                                     }
                                 } catch (_: Exception) {
-                                    // not JSON, ignore
+                                    // Not JSON, ignore
                                 }
 
                                 Log.d("PiLOG", "Received: $msg")
+
                             } catch (e: SocketTimeoutException) {
-                                // allow loop to check `running`
+                                // ignore, allows loop to check `running`
                             } catch (e: Exception) {
                                 Log.e("FW-LOG", "Log receive error: ${e.message}")
                                 Thread.sleep(10)
                             }
                         }
+
                     } catch (e: Exception) {
                         Log.e("FW-LOG", "Log socket failed: ${e.message}")
                     }
