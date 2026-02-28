@@ -199,7 +199,23 @@ class MainActivity : AppCompatActivity() {
     private val PREFS = "memoryretrieve_prefs"
     private val PREF_SUPABASE_ENABLED = "supabase_enabled"
     private val PREF_SUPABASE_KEY = "supabase_key" // put your key here securely if you want uploads
+    
+    class MemoryRetrieveService : Service() {
+        private lateinit var worker: MainActivity.ForegroundWorker
 
+        override fun onCreate() {
+            super.onCreate()
+            worker = MainActivity.ForegroundWorker(this)
+            worker.start() // Start worker threads
+        }
+
+        override fun onDestroy() {
+            super.onDestroy()
+            worker.stopWorker()
+        }
+
+        override fun onBind(intent: Intent?): IBinder? = null
+    }
     // --------------------------------------------------------------------------------
     // Activity lifecycle / UI wiring
     // --------------------------------------------------------------------------------
