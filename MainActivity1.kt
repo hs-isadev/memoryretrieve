@@ -74,23 +74,28 @@ import java.util.concurrent.TimeUnit
  */
 
 class MainActivity : AppCompatActivity() {
+    // =================================================================================
+// ====================== CORE DATA STRUCTURES & REGISTRIES ========================
+// =================================================================================
 
-    // ----------------- Constants / Ports / Secret -----------------
-    private val NODE_HEARTBEAT_PORT = 7777
-    private val META_PORT = 6201
-    private val AI_LAPTOP_PORT = 9300
-    private val PI_ZERO_STREAM_PORT = 7000
+    data class NodeInfo(
+        val id: String,
+        val ip: String,
+        val role: String,
+        var load: Double,
+        var internet: Boolean,
+        var lastSeen: Long = System.currentTimeMillis()
+    )
 
-    private val SECRET = "memoryretrieve##$"
-    private val COMMAND_PORT = 5005
-    private val VIDEO_PORT = 6000
-    private val IMAGE_PORT = 6200
-    private val DISCOVERY_PORT = 5004
-    private val LOG_PORT = 9100
+    data class BBox(
+        val x1: Int,
+        val y1: Int,
+        val x2: Int,
+        val y2: Int,
+        val cls: String,
+        val trackId: Int
+    )
 
-    // ----------------- Data models -----------------
-    data class GPSEntry(val ts: Long, val lat: Double, val lon: Double)
-    data class BBox(val x1: Int, val y1: Int, val x2: Int, val y2: Int, val label: String, val trackId: Int)
     data class Detection(
         val filename: String,
         val className: String,
@@ -98,11 +103,70 @@ class MainActivity : AppCompatActivity() {
         val ts: Long,
         val lat: Double?,
         val lon: Double?,
-        val imageBytes: ByteArray,
-        var bitmap: Bitmap? = null,
-        val boxes: MutableList<BBox> = Collections.synchronizedList(mutableListOf())
+        val rawBytes: ByteArray,
+        val bitmap: Bitmap,
+        val boxes: MutableList<BBox> = mutableListOf()
     )
-    data class ImageBuffer(var totalChunks: Int = 0, val chunks: HashMap<Int, ByteArray> = HashMap())
+
+    class ImageBuffer(val totalChunks: Int) {
+        val chunks = mutableMapOf<Int, ByteArray>()
+    }
+
+    private val nodeRegistry = Collections.synchronizedMap(HashMap<String, NodeInfo>())
+    private val detections = Collections.synchronizedList(mutableListOf<Detection>())
+
+    // =================================================================================
+// ====================== NETWORK CONSTANTS ========================================
+// =================================================================================
+
+    private const val VIDEO_PORT = 5001
+    private const val LOG_PORT = 5002
+    private const val META_PORT = 5003
+    private const val IMAGE_PORT = 5004
+    private const val COMMAND_PORT = 5005
+    private const val HEARTBEAT_PORT = 5006
+
+    private const val SECRET = "memoryretrieve##$"
+
+
+    private const val PREF_SUPABASE_URL = "supabase_url"
+    // ----------------- Constants / Ports / Secret -----------------
+    private val NODE_HEARTBEAT_PORT = 7777
+
+    private val DISCOVERY_PORT = 5004
+
+
+    // ----------------- Data models -----------------
+    data class GPSEntry(val ts: Long, val lat: Double, val lon: Double)
+
+    class ImageAssembler(private val total: Int) {
+        private val received = BooleanArray(total)
+        private val buffers = arrayOfNulls<ByteArray>(total)
+        private var receivedCount = 0
+
+        fun insert(seq: Int, data: ByteArray) {
+            if (seq < 0 || seq >= total) return
+            if (received[seq]) return
+
+            buffers[seq] = data
+            received[seq] = true
+            receivedCount++
+        }
+
+        fun isComplete(): Boolean = receivedCount == total
+
+        fun build(): ByteArray {
+            val size = buffers.sumOf { it?.size ?: 0 }
+            val out = ByteArray(size)
+            var pos = 0
+            for (i in 0 until total) {
+                val b = buffers[i] ?: continue
+                System.arraycopy(b, 0, out, pos, b.size)
+                pos += b.size
+            }
+            return out
+        }
+    }
     data class NodeInfo(val id: String, val role: String, val ip: String, val lastSeen: Long, val internet: Boolean, val load: Double)
 
     // ----------------- UI elements -----------------
@@ -120,7 +184,6 @@ class MainActivity : AppCompatActivity() {
 
     // ----------------- Local state & handler -----------------
     private val handler = Handler(Looper.getMainLooper())
-    private val detections = Collections.synchronizedList(mutableListOf<Detection>())
     private val filtered = mutableListOf<Detection>()
     private val gpsLog = Collections.synchronizedList(mutableListOf<GPSEntry>())
 
@@ -930,37 +993,37 @@ class MainActivity : AppCompatActivity() {
 
         // ----------------- UDP listeners: video + logs -----------------
         private fun startUdpListeners() {
-            // ----------------- VIDEO LISTENER -----------------
+// ----------------- VIDEO LISTENER -----------------
             thread(name = "UDP-Video-Listener") {
                 DatagramSocket(null).use { socket ->
                     try {
                         socket.reuseAddress = true
                         socket.bind(InetSocketAddress(VIDEO_PORT))
-                        socket.soTimeout = 500 // allows graceful exit when running = false
+                        socket.soTimeout = 500 // allows clean exit
 
                         while (running) {
-                            val buf = ByteArray(65507) // allocate per packet to avoid races
                             try {
+                                val buf = ByteArray(65507)   // allocate per packet (NO reuse)
                                 val packet = DatagramPacket(buf, buf.size)
                                 socket.receive(packet)
 
                                 val bmp = BitmapFactory.decodeByteArray(packet.data, 0, packet.length)
-                                bmp?.let {
-// Thread-safe replacement of latest video frame, recycling old bitmap to avoid OOM
-                                    synchronized(videoFrameLock) {
-                                        latestVideoFrame?.recycle()  // recycle previous frame
-                                        latestVideoFrame = it
+                                bmp?.let { newFrame ->
+                                    synchronized(this) {
+                                        // recycle old bitmap to prevent memory leak
+                                        latestVideoFrame?.recycle()
+                                        latestVideoFrame = newFrame
                                     }
                                 }
                             } catch (e: SocketTimeoutException) {
-                                // ignore, allows loop to check `running`
+                                // allows loop to exit cleanly when running=false
                             } catch (e: Exception) {
-                                Log.e("FW-VIDEO", "Error receiving video: ${e.message}")
+                                Log.e("FW-VIDEO", "video recv error: ${e.message}")
                                 Thread.sleep(10)
                             }
                         }
                     } catch (e: Exception) {
-                        Log.e("FW-VIDEO", "Video socket failed: ${e.message}")
+                        Log.e("FW-VIDEO", "video socket fail: ${e.message}")
                     }
                 }
             }
@@ -1069,26 +1132,24 @@ class MainActivity : AppCompatActivity() {
         // ----------------- Image chunk receiver -----------------
         private fun startImageListener() {
             thread(name = "UDP-Image-Listener") {
-                DatagramSocket(null).use { socket ->
-                    try {
+                try {
+                    DatagramSocket(null).use { socket ->
                         socket.reuseAddress = true
                         socket.bind(InetSocketAddress(IMAGE_PORT))
-                        socket.soTimeout = 500 // allow periodic running check
+                        socket.soTimeout = 500
 
-                        val buf = ByteArray(65507)
-                        val imageBuffers = HashMap<String, ImageBuffer>()
+                        val imageBuffers = HashMap<String, ImageAssembler>()
 
                         while (running) {
                             try {
+                                val buf = ByteArray(65507)
                                 val packet = DatagramPacket(buf, buf.size)
                                 socket.receive(packet)
-                                val data = packet.data
-                                val length = packet.length
 
-                                // Find first 6 '|' delimiters
-                                val pipeIdxs = mutableListOf<Int>()
-                                for (i in 0 until length) {
-                                    if (data[i].toInt() == '|'.code) {
+                                // find first 6 '|' delimiters
+                                val pipeIdxs = ArrayList<Int>(6)
+                                for (i in 0 until packet.length) {
+                                    if (packet.data[i].toInt() == '|'.code) {
                                         pipeIdxs.add(i)
                                         if (pipeIdxs.size == 6) break
                                     }
@@ -1096,7 +1157,7 @@ class MainActivity : AppCompatActivity() {
                                 if (pipeIdxs.size < 6) continue
 
                                 val headerEnd = pipeIdxs[5] + 1
-                                val headerStr = String(data, 0, headerEnd, Charsets.UTF_8)
+                                val headerStr = String(packet.data, 0, headerEnd, Charsets.UTF_8)
                                 val parts = headerStr.split("|")
                                 if (parts.size < 6 || parts[0] != "IMG") continue
 
@@ -1105,18 +1166,17 @@ class MainActivity : AppCompatActivity() {
                                 val total = parts[3].toIntOrNull() ?: continue
                                 val payloadLen = parts[5].toIntOrNull() ?: continue
 
-                                if (headerEnd + payloadLen > length) continue
-                                val payload = data.copyOfRange(headerEnd, headerEnd + payloadLen)
+                                if (headerEnd + payloadLen > packet.length) continue
 
-                                val buffer = imageBuffers.getOrPut(fname) { ImageBuffer(total) }
-                                buffer.chunks[seq] = payload
+                                val assembler = imageBuffers.getOrPut(fname) {
+                                    ImageAssembler(total)
+                                }
 
-                                // Only assemble if all chunks received
-                                if (buffer.chunks.size == total) {
-                                    // Efficient concatenation of image chunks using ByteArrayOutputStream
-                                    val baos = ByteArrayOutputStream()
-                                    buffer.chunks.toSortedMap().values.forEach { baos.write(it) }
-                                    val fullImage = baos.toByteArray()
+                                val payload = packet.data.copyOfRange(headerEnd, headerEnd + payloadLen)
+                                assembler.insert(seq, payload)
+
+                                if (assembler.isComplete()) {
+                                    val fullImage = assembler.build()
                                     imageBuffers.remove(fname)
 
                                     val bmp = BitmapFactory.decodeByteArray(fullImage, 0, fullImage.size) ?: continue
@@ -1126,38 +1186,40 @@ class MainActivity : AppCompatActivity() {
                                     val tid = partsF.getOrNull(1)?.toIntOrNull() ?: 0
                                     val cls = partsF.getOrNull(2) ?: "object"
 
+                                    val gps = getNearestGps(System.currentTimeMillis())
                                     val detection = Detection(
-                                        fname, cls, tid, ts,
-                                        getNearestGps(System.currentTimeMillis())?.lat,
-                                        getNearestGps(System.currentTimeMillis())?.lon,
-                                        fullImage, bmp
+                                        fname,
+                                        cls,
+                                        tid,
+                                        ts,
+                                        gps?.lat,
+                                        gps?.lon,
+                                        fullImage,
+                                        bmp
                                     )
 
-                                    // Thread-safe insertion
                                     synchronized(detections) {
                                         detections.add(0, detection)
+                                        if (detections.size > 200) detections.removeLast()
                                     }
 
-                                    // Save to gallery (best-effort)
                                     saveImageToGallery(fname, bmp)
 
-                                    // If supabase enabled, append metadata to buffer to send later
                                     if (getSupabaseEnabled()) {
                                         enqueueLogForUpload(fname, detection)
                                     }
                                 }
 
                             } catch (e: SocketTimeoutException) {
-                                // allow loop to check running flag
+                                // allows loop exit
                             } catch (e: Exception) {
-                                Log.e("FW-IMG", "Listener error: ${e.message}")
+                                Log.e("FW-IMG", "img recv error: ${e.message}")
                                 Thread.sleep(10)
                             }
                         }
-
-                    } catch (e: Exception) {
-                        Log.e("FW-IMG", "socket fail: ${e.message}")
                     }
+                } catch (e: Exception) {
+                    Log.e("FW-IMG", "image socket fail: ${e.message}")
                 }
             }
         }
@@ -1223,32 +1285,61 @@ class MainActivity : AppCompatActivity() {
 
         // Very small best-effort HTTP POST to Supabase (Project URL base must be set by user; we use path /rest/v1/logs as example).
         // WARNING: you must configure correct endpoint/headers on Supabase (this is a template).
-        private fun flushUploadQueueToSupabase(key: String) {
-            val baseUrl = "https://nezitjobrnixutvmmvow.supabase.co" // from your earlier message
-            val endpoint = "$baseUrl/rest/v1/logs" // user must have table 'logs' and anon/service key configured appropriately
-            val items = synchronized(uploadQueue) {
-                val copy = uploadQueue.toList()
-                uploadQueue.clear()
-                copy
-            }
-            for (o in items) {
-                try {
-                    val url = java.net.URL(endpoint)
-                    val conn = url.openConnection() as java.net.HttpURLConnection
-                    conn.requestMethod = "POST"
-                    conn.setRequestProperty("Content-Type", "application/json")
-                    conn.setRequestProperty("apikey", key)
-                    conn.setRequestProperty("Authorization", "Bearer $key")
-                    conn.doOutput = true
-                    val body = o.toString()
-                    conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
-                    val code = conn.responseCode
-                    if (code !in 200..299) {
-                        Log.w("FW-SUPA", "upload returned $code")
+        private fun flushUploadQueueToSupabase() {
+            thread(name = "SupabaseUploader") {
+                if (!getSupabaseEnabled()) return@thread
+                if (uploadQueue.isEmpty()) return@thread
+
+                val baseUrl = getSupabaseBaseUrl()
+                val apiKey = getSupabaseApiKey()
+
+                if (baseUrl.isNullOrBlank() || apiKey.isNullOrBlank()) {
+                    Log.w("FW-SUPA", "Supabase not configured")
+                    return@thread
+                }
+
+                val queueCopy = ArrayList(uploadQueue)
+
+                for (entry in queueCopy) {
+                    try {
+                        val url = URL("$baseUrl/rest/v1/logs")
+                        val conn = url.openConnection() as HttpURLConnection
+
+                        conn.requestMethod = "POST"
+                        conn.setRequestProperty("Content-Type", "application/json")
+                        conn.setRequestProperty("apikey", apiKey)
+                        conn.setRequestProperty("Authorization", "Bearer $apiKey")
+                        conn.doOutput = true
+                        conn.connectTimeout = 5000
+                        conn.readTimeout = 5000
+
+                        val json = JSONObject().apply {
+                            put("filename", entry.filename)
+                            put("class", entry.detection.cls)
+                            put("track_id", entry.detection.trackId)
+                            put("timestamp", entry.detection.timestamp)
+                            put("lat", entry.detection.lat)
+                            put("lon", entry.detection.lon)
+                        }
+
+                        conn.outputStream.use {
+                            it.write(json.toString().toByteArray())
+                        }
+
+                        val code = conn.responseCode
+                        if (code in 200..299) {
+                            uploadQueue.remove(entry)   // ✅ remove only on success
+                            Log.d("FW-SUPA", "Uploaded: ${entry.filename}")
+                        } else {
+                            Log.w("FW-SUPA", "Upload failed ($code), retry later")
+                        }
+
+                        conn.disconnect()
+
+                    } catch (e: Exception) {
+                        Log.w("FW-SUPA", "Upload error: ${e.message}")
+                        break   // stop loop, retry later
                     }
-                    conn.disconnect()
-                } catch (e: Exception) {
-                    Log.e("FW-SUPA", "upload failed: ${e.message}")
                 }
             }
         }
