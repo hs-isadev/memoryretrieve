@@ -1051,8 +1051,9 @@ class MainActivity : AppCompatActivity() {
                                         lastPortalHtml = html
                                         lastPortalFromIp = packet.address.hostAddress
 
-                                        (ctx as? MainActivity)?.runOnUiThread {
-                                            (ctx as? MainActivity)?.openPortalActivity(html, lastPortalFromIp)
+                                        // UI thread call using Activity context
+                                        (runOnUiThread) {
+                                            openPortalActivity(html, lastPortalFromIp)
                                         }
                                         continue
                                     }
@@ -1227,7 +1228,7 @@ class MainActivity : AppCompatActivity() {
         private fun saveImageToGallery(fname: String, bitmap: Bitmap) {
             try {
                 val filename = "$fname.jpg"
-                val resolver = ctx.contentResolver
+                val resolver = this@MainActivity.contentResolver
                 val contentValues = ContentValues().apply {
                     put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
                     put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
@@ -1406,8 +1407,8 @@ class MainActivity : AppCompatActivity() {
                                 if (piAp != null) {
                                     Log.d("FW-AP", "Found Pi AP: ${piAp.SSID}")
                                     // ask MainActivity to show popup
-                                    (ctx as? MainActivity)?.runOnUiThread {
-                                        (ctx as? MainActivity)?.showPiConnectPopup(piAp.SSID)
+                                    this@MainActivity.runOnUiThread {
+                                        openPortalActivity(html, lastPortalFromIp)
                                     }
                                     // Wait a bit so we don't spam UI
                                     Thread.sleep(8000)
