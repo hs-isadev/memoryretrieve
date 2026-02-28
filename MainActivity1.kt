@@ -1663,7 +1663,7 @@ class MainActivity : AppCompatActivity() {
         }
         private fun hasInternet(): Boolean {
             try {
-                val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+                val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
                 val net = cm.activeNetwork ?: return false
                 val caps = cm.getNetworkCapabilities(net) ?: return false
                 return caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
