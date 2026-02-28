@@ -205,14 +205,13 @@ class MainActivity : AppCompatActivity() {
         btnSearch.setOnClickListener { filterDetections() }
 
         // Start the foreground worker (keeps running while screen off)
-        worker = ForegroundWorker(this)
-        worker?.start() // starts foreground notification + background threads
+        startForegroundService(Intent(this, MemoryRetrieveService::class.java))
 
         // build orchestration UI overlay (route panel + supabase switch)
         setupOrchestrationUI()
         startNetworkOrchestration()
         startOrchestratorBrain()
-        orchestrationBrainLoop()
+
 
         // Periodic UI refresh from worker state
         handler.post(uiRefresh)
@@ -689,6 +688,7 @@ class MainActivity : AppCompatActivity() {
     // ----------------- ForegroundWorker: runs in-process background threads and holds all sockets/state
     // (keeps everything in single file per user's request)
     // --------------------------------------------------------------------------------
+    private val videoFrameLock = Any()
     inner class ForegroundWorker(private val ctx: Context) {
         // Shared state exposed to Activity
         val detections = Collections.synchronizedList(mutableListOf<Detection>())
@@ -751,36 +751,38 @@ class MainActivity : AppCompatActivity() {
         }
 
         // ----------------- Foreground notification (keeps it alive) -----------------
-        private fun startForegroundCompat() {
+// Call this inside a true Service (MemoryRetrieveService)
+        private fun startForegroundCompat(service: Service) {
             try {
-                val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                val nm = service.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
                 val channelId = "memretr_service_chan"
+
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    val ch = NotificationChannel(channelId, "MemoryRetrieve", NotificationManager.IMPORTANCE_LOW)
+                    val ch = NotificationChannel(
+                        channelId,
+                        "MemoryRetrieve",
+                        NotificationManager.IMPORTANCE_LOW
+                    )
                     nm.createNotificationChannel(ch)
                 }
-                val intent = Intent(ctx, MainActivity::class.java)
-                val p = PendingIntent.getActivity(ctx, 0, intent, if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_IMMUTABLE else 0)
-                val notif = NotificationCompat.Builder(ctx, channelId)
+
+                val intent = Intent(service, MainActivity::class.java)
+                val pendingFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+                    PendingIntent.FLAG_IMMUTABLE
+                else 0
+                val pIntent = PendingIntent.getActivity(service, 0, intent, pendingFlags)
+
+                val notif = NotificationCompat.Builder(service, channelId)
                     .setContentTitle("MemoryRetrieve running")
                     .setContentText("Background services active")
                     .setSmallIcon(R.drawable.ic_launcher_foreground)
-                    .setContentIntent(p)
+                    .setContentIntent(pIntent)
                     .setOngoing(true)
                     .build()
 
-                // Use context as Activity if possible; else start a minimal foreground service via NotificationManager
-                (ctx as? Activity)?.runOnUiThread {
-                    try {
-                        // Ensure true foreground service
-                        if (ctx is Service) {
-                            (ctx as Service).startForeground(notifId, notif)
-                        }
-                        nm.notify(notifId, notif)
-                    } catch (e: Exception) {
-                        Log.w("FW-NOTIF", "notify failed: ${e.message}")
-                    }
-                }
+                // Start true foreground
+                service.startForeground(notifId, notif)
+
             } catch (e: Exception) {
                 Log.w("FW-NOTIF", "startForegroundCompat error: ${e.message}")
             }
@@ -890,13 +892,11 @@ class MainActivity : AppCompatActivity() {
                 try {
                     DatagramSocket(DISCOVERY_PORT).use { socket ->
                         socket.broadcast = true
-                        val buf = ByteArray(1024)
-                        val secretMsg = "$SECRET|DISCOVER".toByteArray()
-
                         // reply listener
                         thread {
                             while (running) {
                                 try {
+                                    val buf = ByteArray(1024) // allocate per iteration
                                     val packet = DatagramPacket(buf, buf.size)
                                     socket.receive(packet)
                                     val msg = String(packet.data, 0, packet.length)
@@ -930,104 +930,151 @@ class MainActivity : AppCompatActivity() {
 
         // ----------------- UDP listeners: video + logs -----------------
         private fun startUdpListeners() {
-            // video
-            thread {
-                try {
-                    DatagramSocket(VIDEO_PORT).use { s ->
-                        val buf = ByteArray(65507)
+            // ----------------- VIDEO LISTENER -----------------
+            thread(name = "UDP-Video-Listener") {
+                DatagramSocket(null).use { socket ->
+                    try {
+                        socket.reuseAddress = true
+                        socket.bind(InetSocketAddress(VIDEO_PORT))
+                        socket.soTimeout = 500 // allows graceful exit when running = false
+
                         while (running) {
+                            val buf = ByteArray(65507) // allocate per packet to avoid races
                             try {
-                                val p = DatagramPacket(buf, buf.size)
-                                s.receive(p)
-                                val bmp = BitmapFactory.decodeByteArray(p.data, 0, p.length)
-                                bmp?.let { latestVideoFrame = it }
+                                val packet = DatagramPacket(buf, buf.size)
+                                socket.receive(packet)
+
+                                val bmp = BitmapFactory.decodeByteArray(packet.data, 0, packet.length)
+                                bmp?.let {
+// Thread-safe replacement of latest video frame, recycling old bitmap to avoid OOM
+                                    synchronized(videoFrameLock) {
+                                        latestVideoFrame?.recycle()  // recycle previous frame
+                                        latestVideoFrame = it
+                                    }
+                                }
+                            } catch (e: SocketTimeoutException) {
+                                // ignore, allows loop to check `running`
                             } catch (e: Exception) {
                                 Log.e("FW-VIDEO", "Error receiving video: ${e.message}")
                                 Thread.sleep(10)
                             }
                         }
+                    } catch (e: Exception) {
+                        Log.e("FW-VIDEO", "Video socket failed: ${e.message}")
                     }
-                } catch (e: Exception) {
-                    Log.e("FW-VIDEO", "video socket fail: ${e.message}")
                 }
             }
 
-            // logs
-            thread {
-                try {
-                    DatagramSocket(LOG_PORT).use { s ->
-                        val buf = ByteArray(16384)
+            // ----------------- LOG LISTENER -----------------
+            thread(name = "UDP-Log-Listener") {
+                DatagramSocket(null).use { socket ->
+                    try {
+                        socket.reuseAddress = true
+                        socket.bind(InetSocketAddress(LOG_PORT))
+                        socket.soTimeout = 500
+
                         while (running) {
+                            val buf = ByteArray(16384) // allocate per packet
                             try {
-                                val p = DatagramPacket(buf, buf.size)
-                                s.receive(p)
-                                val msg = String(p.data, 0, p.length, Charsets.UTF_8)
-                                // Attempt to parse portal forwards (if Pi sends JSON type PORTAL_PAGE)
+                                val packet = DatagramPacket(buf, buf.size)
+                                socket.receive(packet)
+                                val msg = String(packet.data, 0, packet.length, Charsets.UTF_8)
+
+                                // Handle portal JSON forwards
                                 try {
                                     val json = JSONObject(msg)
                                     if (json.optString("type") == "PORTAL_PAGE") {
                                         val html = json.optString("html", "")
                                         lastPortalHtml = html
-                                        lastPortalFromIp = p.address.hostAddress
-                                        // Launch portal UI on phone for user to authenticate
+                                        lastPortalFromIp = packet.address.hostAddress
+
                                         (ctx as? MainActivity)?.runOnUiThread {
                                             (ctx as? MainActivity)?.openPortalActivity(html, lastPortalFromIp)
                                         }
                                         continue
                                     }
-                                } catch (_: Exception) { /* not JSON */ }
+                                } catch (_: Exception) {
+                                    // not JSON, ignore
+                                }
 
                                 Log.d("PiLOG", "Received: $msg")
+                            } catch (e: SocketTimeoutException) {
+                                // allow loop to check `running`
                             } catch (e: Exception) {
-                                Log.e("FW-LOG", "log recv error: ${e.message}")
+                                Log.e("FW-LOG", "Log receive error: ${e.message}")
                                 Thread.sleep(10)
                             }
                         }
+                    } catch (e: Exception) {
+                        Log.e("FW-LOG", "Log socket failed: ${e.message}")
                     }
-                } catch (e: Exception) {
-                    Log.e("FW-LOG", "log socket fail: ${e.message}")
                 }
             }
         }
 
         // ----------------- Metadata listener (bbox messages) -----------------
         private fun startMetadataListener() {
-            thread {
-                try {
-                    DatagramSocket(META_PORT).use { socket ->
+            thread(name = "UDP-Meta-Listener") {
+                DatagramSocket(null).use { socket ->
+                    try {
+                        socket.reuseAddress = true
+                        socket.bind(InetSocketAddress(META_PORT))
+                        socket.soTimeout = 500 // allow periodic running check
                         val buf = ByteArray(8192)
+
                         while (running) {
                             try {
                                 val packet = DatagramPacket(buf, buf.size)
                                 socket.receive(packet)
-                                val msg = String(packet.data, 0, packet.length)
-                                val json = JSONObject(msg)
+                                val msg = String(packet.data, 0, packet.length, Charsets.UTF_8)
+
+                                val json = try { JSONObject(msg) } catch (e: Exception) {
+                                    Log.w("FW-META", "Invalid JSON: ${e.message}")
+                                    continue
+                                }
+
                                 if (json.optString("type") != "bbox") continue
 
                                 val fname = json.getString("filename")
-                                val bbox = json.getJSONArray("bbox")
-                                val box = BBox(bbox.getInt(0), bbox.getInt(1), bbox.getInt(2), bbox.getInt(3), json.getString("classname"), json.getInt("trackId"))
+                                val bboxArray = json.getJSONArray("bbox")
+                                val box = BBox(
+                                    bboxArray.getInt(0),
+                                    bboxArray.getInt(1),
+                                    bboxArray.getInt(2),
+                                    bboxArray.getInt(3),
+                                    json.getString("classname"),
+                                    json.getInt("trackId")
+                                )
 
-                                // attach to detection if exists
-                                val found = detections.find { it.filename == fname }
-                                found?.boxes?.add(box)
+                                // Thread-safe addition to detection
+                                synchronized(detections) {
+                                    val found = detections.find { it.filename == fname }
+                                    found?.boxes?.add(box)
+                                }
+
+                            } catch (e: SocketTimeoutException) {
+                                // ignore timeout, allows loop to check running
                             } catch (e: Exception) {
-                                Log.e("FW-META", "bbox recv error: ${e.message}")
+                                Log.e("FW-META", "BBox receive error: ${e.message}")
                                 Thread.sleep(10)
                             }
                         }
+                    } catch (e: Exception) {
+                        Log.e("FW-META", "Meta socket failed: ${e.message}")
                     }
-                } catch (e: Exception) {
-                    Log.e("FW-META", "meta socket fail: ${e.message}")
                 }
             }
         }
 
         // ----------------- Image chunk receiver -----------------
         private fun startImageListener() {
-            thread {
-                try {
-                    DatagramSocket(IMAGE_PORT).use { socket ->
+            thread(name = "UDP-Image-Listener") {
+                DatagramSocket(null).use { socket ->
+                    try {
+                        socket.reuseAddress = true
+                        socket.bind(InetSocketAddress(IMAGE_PORT))
+                        socket.soTimeout = 500 // allow periodic running check
+
                         val buf = ByteArray(65507)
                         val imageBuffers = HashMap<String, ImageBuffer>()
 
@@ -1035,11 +1082,13 @@ class MainActivity : AppCompatActivity() {
                             try {
                                 val packet = DatagramPacket(buf, buf.size)
                                 socket.receive(packet)
+                                val data = packet.data
+                                val length = packet.length
 
-                                // find first 6 '|' delimiters
-                                val pipeIdxs = ArrayList<Int>(6)
-                                for (i in 0 until packet.length) {
-                                    if (packet.data[i].toInt() == '|'.code) {
+                                // Find first 6 '|' delimiters
+                                val pipeIdxs = mutableListOf<Int>()
+                                for (i in 0 until length) {
+                                    if (data[i].toInt() == '|'.code) {
                                         pipeIdxs.add(i)
                                         if (pipeIdxs.size == 6) break
                                     }
@@ -1047,7 +1096,7 @@ class MainActivity : AppCompatActivity() {
                                 if (pipeIdxs.size < 6) continue
 
                                 val headerEnd = pipeIdxs[5] + 1
-                                val headerStr = String(packet.data, 0, headerEnd, Charsets.UTF_8)
+                                val headerStr = String(data, 0, headerEnd, Charsets.UTF_8)
                                 val parts = headerStr.split("|")
                                 if (parts.size < 6 || parts[0] != "IMG") continue
 
@@ -1056,14 +1105,18 @@ class MainActivity : AppCompatActivity() {
                                 val total = parts[3].toIntOrNull() ?: continue
                                 val payloadLen = parts[5].toIntOrNull() ?: continue
 
-                                if (headerEnd + payloadLen > packet.length) continue
-                                val payload = packet.data.copyOfRange(headerEnd, headerEnd + payloadLen)
+                                if (headerEnd + payloadLen > length) continue
+                                val payload = data.copyOfRange(headerEnd, headerEnd + payloadLen)
 
                                 val buffer = imageBuffers.getOrPut(fname) { ImageBuffer(total) }
                                 buffer.chunks[seq] = payload
 
+                                // Only assemble if all chunks received
                                 if (buffer.chunks.size == total) {
-                                    val fullImage = buffer.chunks.toSortedMap().values.reduce { a, b -> a + b }
+                                    // Efficient concatenation of image chunks using ByteArrayOutputStream
+                                    val baos = ByteArrayOutputStream()
+                                    buffer.chunks.toSortedMap().values.forEach { baos.write(it) }
+                                    val fullImage = baos.toByteArray()
                                     imageBuffers.remove(fname)
 
                                     val bmp = BitmapFactory.decodeByteArray(fullImage, 0, fullImage.size) ?: continue
@@ -1073,10 +1126,19 @@ class MainActivity : AppCompatActivity() {
                                     val tid = partsF.getOrNull(1)?.toIntOrNull() ?: 0
                                     val cls = partsF.getOrNull(2) ?: "object"
 
-                                    val detection = Detection(fname, cls, tid, ts, getNearestGps(System.currentTimeMillis())?.lat, getNearestGps(System.currentTimeMillis())?.lon, fullImage, bmp)
-                                    detections.add(0, detection)
+                                    val detection = Detection(
+                                        fname, cls, tid, ts,
+                                        getNearestGps(System.currentTimeMillis())?.lat,
+                                        getNearestGps(System.currentTimeMillis())?.lon,
+                                        fullImage, bmp
+                                    )
 
-                                    // save to gallery (best-effort)
+                                    // Thread-safe insertion
+                                    synchronized(detections) {
+                                        detections.add(0, detection)
+                                    }
+
+                                    // Save to gallery (best-effort)
                                     saveImageToGallery(fname, bmp)
 
                                     // If supabase enabled, append metadata to buffer to send later
@@ -1085,14 +1147,17 @@ class MainActivity : AppCompatActivity() {
                                     }
                                 }
 
+                            } catch (e: SocketTimeoutException) {
+                                // allow loop to check running flag
                             } catch (e: Exception) {
                                 Log.e("FW-IMG", "Listener error: ${e.message}")
                                 Thread.sleep(10)
                             }
                         }
+
+                    } catch (e: Exception) {
+                        Log.e("FW-IMG", "socket fail: ${e.message}")
                     }
-                } catch (e: Exception) {
-                    Log.e("FW-IMG", "socket fail: ${e.message}")
                 }
             }
         }
@@ -1210,21 +1275,24 @@ class MainActivity : AppCompatActivity() {
 
         // send to all known nodes (simple loop)
         fun sendCommandToAllNodes(cmd: String) {
-            thread {
+            thread(name = "CMD-All-Nodes") {
+                val nodes = nodeRegistry.values.toList()
+                if (nodes.isEmpty()) return@thread
+
                 try {
-                    val nodes = nodeRegistry.values.toList()
-                    nodes.forEach { n ->
-                        try {
-                            DatagramSocket().use { s ->
-                                val msg = "$SECRET|$cmd".toByteArray()
-                                s.send(DatagramPacket(msg, msg.size, InetAddress.getByName(n.ip), COMMAND_PORT))
+                    DatagramSocket().use { socket ->
+                        val msg = "$SECRET|$cmd".toByteArray()
+                        nodes.forEach { n ->
+                            try {
+                                val addr = InetAddress.getByName(n.ip)
+                                socket.send(DatagramPacket(msg, msg.size, addr, COMMAND_PORT))
+                            } catch (e: Exception) {
+                                Log.w("FW-CMDALL", "Failed to send to ${n.ip}: ${e.message}")
                             }
-                        } catch (e: Exception) {
-                            Log.w("FW-CMDALL", "to ${n.ip} failed: ${e.message}")
                         }
                     }
                 } catch (e: Exception) {
-                    Log.e("FW-CMDALL", "sendAll error: ${e.message}")
+                    Log.e("FW-CMDALL", "Socket error: ${e.message}")
                 }
             }
         }
@@ -1496,10 +1564,9 @@ class MainActivity : AppCompatActivity() {
                 nodeRegistry.remove(it.id)
             }
 
-// Remove thread creation; orchestrationBrainLoop() is started once at init
             if (deadNodes.isNotEmpty()) {
                 Log.w("FAILOVER", "Node(s) lost: ${deadNodes.joinToString { it.id }}")
-                // Optionally, immediately re-evaluate routing
+                // Immediately adjust routing using the existing brain
                 evaluateRouting()
             }
         }
