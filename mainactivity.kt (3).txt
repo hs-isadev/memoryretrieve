@@ -1,35 +1,35 @@
 package com.trackit.myapplication
-// ---------------- Kotlin / Java stdlib ----------------
+import androidx.compose.material.icons.filled.AccountTree
+import androidx.compose.material.icons.filled.Forum
+import androidx.compose.material.icons.filled.Map
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.foundation.layout.padding
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableIntStateOf
+import android.provider.Settings
 import kotlin.math.max
-import kotlin.collections.HashMap
-import kotlin.concurrent.thread
-import java.util.*
-import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.Executors
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.TimeUnit
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-import java.net.InetSocketAddress
-import java.net.SocketTimeoutException
-import java.net.HttpURLConnection
-import java.net.URL
-
-// ---------------- Android framework ----------------
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.*
 import android.content.*
-import android.content.ContentValues
-import android.content.Context
-import android.content.Intent
 import android.graphics.*
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.Spacer
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.net.wifi.WifiNetworkSpecifier
@@ -38,7 +38,6 @@ import android.net.Network
 import android.net.NetworkRequest
 import android.os.*
 import android.provider.MediaStore
-import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
 import android.view.Window
@@ -46,101 +45,94 @@ import android.view.WindowManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.*
-import android.widget.Button
-import android.widget.ImageView
-import android.widget.LinearLayout
-import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
-import androidx.appcompat.app.AlertDialog
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
-import androidx.core.content.ContextCompat
-
-// ---------------- Coroutines / JSON / Networking ----------------
 import kotlinx.coroutines.*
 import org.json.JSONObject
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.FormBody
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
+import java.util.*
+import kotlin.collections.HashMap
+import kotlin.concurrent.thread
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okhttp3.Response
-import okhttp3.MediaType.Companion.toMediaType
 import okio.ByteString
-
-// ---------------- Crypto ----------------
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
-
-// ---------------- CameraX ----------------
+import android.bluetooth.*
+import android.bluetooth.le.ScanCallback
+import androidx.appcompat.app.AlertDialog
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
+import java.net.InetSocketAddress
+import java.net.SocketTimeoutException
+import java.net.HttpURLConnection
+import java.net.URL
+import android.app.Dialog
+import android.content.ContentValues
+import android.content.Context
+import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.os.Build
+import android.os.Bundle
+import android.widget.Button
+import android.widget.ImageView
+import androidx.compose.foundation.lazy.items as lazyItems
+import androidx.compose.foundation.lazy.grid.items as gridItems
+import androidx.compose.material3.Icon
+import androidx.compose.material3.Text
+import androidx.compose.material3.Scaffold
+import android.widget.LinearLayout
+import android.widget.TextView
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.core.ImageProxy
 import androidx.camera.lifecycle.ProcessCameraProvider
-
-// ---------------- TensorFlow Lite ----------------
+import okhttp3.OkHttpClient
+import okhttp3.FormBody
+import okhttp3.Request
+import androidx.core.content.ContextCompat
+import java.util.UUID
+import java.util.concurrent.Executors
+import java.util.concurrent.ExecutorService
+import java.util.Collections
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.support.image.TensorImage
 import org.tensorflow.lite.support.image.ops.ResizeOp
 import org.tensorflow.lite.support.image.ImageProcessor
-
-// ---------------- Compose runtime ----------------
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.setValue
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.mutableIntStateOf
-
-// ---------------- Compose UI / Foundation / Layout ----------------
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.Alignment
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.viewinterop.AndroidView
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.LazyListState
-import androidx.compose.foundation.lazy.items as lazyItems
-import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.GridCells
-import androidx.compose.foundation.lazy.grid.items as gridItems
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.aspectRatio
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Column
-
-// ---------------- Compose Animation ----------------
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.core.RepeatMode
-
-// ---------------- Compose Text / Input ----------------
-import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-
-// ---------------- Compose Material3 & Icons ----------------
-import androidx.compose.material3.Icon
-import androidx.compose.material3.Text
-import androidx.compose.material3.NavigationBar
-import androidx.compose.material3.NavigationBarItem
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.AccountTree
@@ -151,13 +143,9 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Send
-
-// ---------------- Misc / Utilities ----------------
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetAddress
-import kotlin.collections.HashMap
-import kotlin.math.max
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import okhttp3.MediaType.Companion.toMediaType
 // -------------------------------
 // IMPORTANT: Manifest notes (ADD THESE)
 // -------------------------------
