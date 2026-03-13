@@ -1,4 +1,12 @@
 package com.trackit.myapplication
+import androidx.compose.material.icons.filled.AccountTree
+import androidx.compose.material.icons.filled.Forum
+import androidx.compose.material.icons.filled.Map
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.foundation.layout.padding
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.mutableIntStateOf
@@ -3137,37 +3145,39 @@ class MainActivity : AppCompatActivity() {
     fun TrackItApp() {
         val navItems = listOf("Dashboard", "Nodes", "Network", "Map", "Chat", "Settings")
         val icons = listOf(
-            androidx.compose.material.icons.Icons.Default.Home,
-            androidx.compose.material.icons.Icons.Default.AccountTree,
-            androidx.compose.material.icons.Icons.Default.Wifi,
-            androidx.compose.material.icons.Icons.Default.Map,
-            androidx.compose.material.icons.Icons.Default.Forum,
-            androidx.compose.material.icons.Icons.Default.Settings
+            Icons.Default.Home,
+            Icons.Default.AccountTree,
+            Icons.Default.Wifi,
+            Icons.Default.Map,
+            Icons.Default.Forum,
+            Icons.Default.Settings
         )
-        var selectedTab by androidx.compose.runtime.remember {
-            androidx.compose.runtime.mutableIntStateOf(0)
-        }
 
-        androidx.compose.material3.Scaffold(
-            containerColor = androidx.compose.ui.graphics.Color.Transparent,
+        // use delegated property for compose state
+        var selectedTab by remember { mutableIntStateOf(0) }
+
+        Scaffold(
+            containerColor = Color.Transparent,
             bottomBar = {
-                androidx.compose.material3.NavigationBar {
-                    for (i in navItems.indices) {
-                        androidx.compose.material3.NavigationBarItem(
+                NavigationBar {
+                    // keep your same items/order; iterate cleanly
+                    navItems.forEachIndexed { i, title ->
+                        NavigationBarItem(
                             selected = selectedTab == i,
                             onClick = { selectedTab = i },
                             icon = {
-                                androidx.compose.material3.Icon(
+                                Icon(
                                     imageVector = icons[i],
-                                    contentDescription = navItems[i]
+                                    contentDescription = title
                                 )
                             },
-                            label = { androidx.compose.material3.Text(navItems[i]) }
+                            label = { Text(title) }
                         )
                     }
                 }
             }
-        ) { _ ->
+        ) { innerPadding ->
+            // Scaffold content lambda is composable — safe to call your screen composables here
             when (selectedTab) {
                 0 -> DashboardScreenStub()
                 1 -> NodesScreenStub()
